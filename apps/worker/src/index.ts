@@ -28,6 +28,7 @@ import {
   session,
   setupStatus,
 } from "./auth";
+import { readAuthSecurity, testAuthSecurityTurnstile, updateAuthSecurity } from "./auth-security";
 import { deleteAsset, listUploadedAssets, readAsset, uploadAsset } from "./assets";
 import {
   calendarFeedIcs,
@@ -40,6 +41,7 @@ import {
   readSubscriptionCalendarFeed,
 } from "./calendar-feed";
 import { readCustomConfig, readSettings, updateCustomConfig, updateSettings } from "./settings";
+import { putExchangeRateSnapshot, readExchangeRateSnapshots } from "./exchange-rate-snapshots";
 import { createSubscription, deleteSubscription, readSubscriptions, renewSubscription, updateSubscription } from "./subscriptions";
 import { applyImport, previewImport } from "./import-export";
 import {
@@ -61,7 +63,7 @@ import {
 } from "./media-icon-index";
 import { consumeBuiltInIconIndexRefreshQueue } from "./media-icon-index-refresh-queue";
 import { mediaCandidates } from "./search";
-import { notificationHistory, notificationRun, notificationTest, runScheduledNotifications } from "./notifications";
+import { notificationHistory, notificationOverview, notificationRun, notificationTest, runScheduledNotifications } from "./notifications";
 import { renewAutoSubscriptionsForAllUsers } from "./subscription-renewal";
 import {
   createPublicStatusPage,
@@ -87,8 +89,8 @@ import {
   readTelegramBotCommands,
   telegramWebhook,
 } from "./telegram-bot";
-import { systemRestart, systemUpdate, systemVersion } from "./system";
-import { errorResponse, methodNotAllowed, requestLocale, successJson, toResponse, type AppLocale } from "./http";
+import { systemRestart, systemUpdate, systemUpdateStatus, systemVersion } from "./system";
+import { errorResponse, methodNotAllowed, requestLocale, requireSameOriginUnsafe, successJson, toResponse, type AppLocale } from "./http";
 import { serverText } from "./server-i18n";
 import type { Env } from "./types";
 
@@ -104,6 +106,11 @@ type AppRouter = Hono<AppBindings>;
 type RouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 type RouteHandler = (context: AppContext) => Response | Promise<Response>;
 
+export interface RuntimeRouteManifestEntry {
+  path: string;
+  methods: RouteMethod[];
+}
+
 /**
  * Cloudflare Worker 入口。
  *
@@ -115,6 +122,10 @@ const app = newAppRouter();
 app.use("*", async (context, next) => {
   // locale 必须在全局 middleware 设置，404/405/onError 这类未进入业务 handler 的响应也依赖它。
   context.set("locale", requestLocale(context.req.raw));
+  // CSRF 的同源检查只约束浏览器产品 API；Public API、Telegram、ICS 和 Cron 都有自己的 bearer/secret 边界。
+  if (context.req.path.startsWith("/api/app/")) {
+    requireSameOriginUnsafe(context.req.raw, context.get("locale"));
+  }
   await next();
 });
 
@@ -177,7 +188,14 @@ defineRoute(adminRoutes, "/users/:id", {
   DELETE: (context) => adminDeleteUser(context.req.raw, context.env, routeParam(context, "id")),
 });
 defineRoute(adminRoutes, "/system/update", { POST: (context) => systemUpdate(context.req.raw, context.env) });
+defineRoute(adminRoutes, "/system/update/status", { GET: (context) => systemUpdateStatus(context.req.raw, context.env) });
 defineRoute(adminRoutes, "/system/restart", { POST: (context) => systemRestart(context.req.raw, context.env) });
+// 访问安全是站点级管理员策略；这里必须和用户 settings 路由分开，避免 secret 进入账号草稿/导出链路。
+defineRoute(adminRoutes, "/auth-security", {
+  GET: (context) => readAuthSecurity(context.req.raw, context.env),
+  PUT: (context) => updateAuthSecurity(context.req.raw, context.env),
+});
+defineRoute(adminRoutes, "/auth-security/turnstile/test", { POST: (context) => testAuthSecurityTurnstile(context.req.raw, context.env) });
 defineRoute(adminRoutes, "/media/icon-index", { GET: (context) => builtInIconIndexStatus(context.req.raw, context.env) });
 defineRoute(adminRoutes, "/media/icon-index/providers/:provider/check", {
   POST: (context) => checkBuiltInIconIndexProvider(context.req.raw, context.env, routeParam(context, "provider")),
@@ -202,6 +220,13 @@ defineRoute(app, "/api/app/settings", {
 defineRoute(app, "/api/app/custom-config", {
   GET: (context) => readCustomConfig(context.req.raw, context.env),
   PUT: (context) => updateCustomConfig(context.req.raw, context.env),
+});
+
+defineRoute(app, "/api/app/exchange-rate-snapshots", {
+  GET: (context) => readExchangeRateSnapshots(context.req.raw, context.env),
+});
+defineRoute(app, "/api/app/exchange-rate-snapshots/:month", {
+  PUT: (context) => putExchangeRateSnapshot(context.req.raw, context.env, routeParam(context, "month")),
 });
 
 const apiTokenRoutes = newAppRouter();
@@ -291,6 +316,7 @@ defineRoute(app, "/api/app/public-status-page", {
 });
 
 defineRoute(app, "/api/app/notifications/history", { GET: (context) => notificationHistory(context.req.raw, context.env) });
+defineRoute(app, "/api/app/notifications/overview", { GET: (context) => notificationOverview(context.req.raw, context.env) });
 defineRoute(app, "/api/app/notifications/test", { POST: (context) => notificationTest(context.req.raw, context.env) });
 defineRoute(app, "/api/app/notifications/run", { POST: (context) => notificationRun(context.req.raw, context.env) });
 defineRoute(app, "/api/app/media/candidates", { POST: (context) => mediaCandidates(context.req.raw, context.env) });
@@ -323,7 +349,7 @@ function routeParam(context: AppContext, name: string): string {
 }
 
 /**
- * defineRoute 保留旧 routeMethods 的同路径 405 语义；Hono 负责匹配，业务 handler 仍只拿原始 Request/Env。
+ * defineRoute 集中维护同路径 405 语义；Hono 负责匹配，业务 handler 仍只拿原始 Request/Env。
  */
 function defineRoute(router: AppRouter, path: string, handlers: Partial<Record<RouteMethod, RouteHandler>>): void {
   if (handlers.GET) router.get(path, handlers.GET);
@@ -332,6 +358,31 @@ function defineRoute(router: AppRouter, path: string, handlers: Partial<Record<R
   if (handlers.PATCH) router.patch(path, handlers.PATCH);
   if (handlers.DELETE) router.delete(path, handlers.DELETE);
   router.all(path, (context) => methodNotAllowed(context.get("locale") ?? requestLocale(context.req.raw)));
+}
+
+/** 从 Hono 已注册 routes 导出产品契约；ALL fallback、scheduled 和 queue 不属于 HTTP route manifest。 */
+export function workerProductRouteManifest(): RuntimeRouteManifestEntry[] {
+  const methodsByPath = new Map<string, Set<RouteMethod>>();
+  for (const route of app.routes) {
+    const method = route.method.toUpperCase();
+    if (!isRouteMethod(method)) continue;
+    const path = normalizeRuntimeRoutePath(route.path);
+    const methods = methodsByPath.get(path) ?? new Set<RouteMethod>();
+    methods.add(method);
+    methodsByPath.set(path, methods);
+  }
+  return [...methodsByPath.entries()]
+    .map(([path, methods]) => ({ path, methods: [...methods].sort() }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function isRouteMethod(method: string): method is RouteMethod {
+  return method === "GET" || method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
+function normalizeRuntimeRoutePath(path: string): string {
+  const normalized = `/${path.trim().replace(/^\/+|\/+$/g, "")}`.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
+  return normalized === "/" ? normalized : normalized.replace(/\/$/, "");
 }
 
 async function runScheduledTasks(env: Env): Promise<void> {

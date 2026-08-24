@@ -21,6 +21,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -28,6 +29,9 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkCloudflareDevRunner } from "./check-cloudflare-dev-runner.mjs";
+import { checkCloudflareD1DeployContract } from "./check-cloudflare-d1-deploy-contract.mjs";
+import { checkDockerBuildContract } from "./check-docker-build-contract.mjs";
 import { checkSyncRenewletUpstream } from "./check-deploy-sync-upstream.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -175,6 +179,80 @@ function checkComposeConfig() {
   run("docker", ["compose", "-f", "docker-compose.ghcr.yml", "config"]);
 }
 
+function checkGoToolchainConsistency() {
+  const goModPath = join(repoRoot, "apps/docker-server/go.mod");
+  const goDirectives = [...readFileSync(goModPath, "utf8").matchAll(/^go\s+(\d+\.\d+\.\d+)\s*$/gm)];
+  if (goDirectives.length !== 1) {
+    throw new Error("apps/docker-server/go.mod must contain exactly one patch-level Go directive.");
+  }
+  const goVersion = goDirectives[0][1];
+
+  const dockerfile = readFileSync(join(repoRoot, "Dockerfile"), "utf8");
+  const dockerBuilder = /^FROM(?:\s+--platform=\S+)?\s+golang:(?<version>\d+\.\d+\.\d+)-\S+\s+AS\s+server-builder\s*$/m.exec(
+    dockerfile,
+  );
+  if (!dockerBuilder?.groups?.version) {
+    throw new Error("Dockerfile must keep a patch-pinned golang server-builder image.");
+  }
+  if (dockerBuilder.groups.version !== goVersion) {
+    throw new Error(
+      `Dockerfile Go version ${dockerBuilder.groups.version} must match go.mod ${goVersion}.`,
+    );
+  }
+
+  const workflowDir = join(repoRoot, ".github/workflows");
+  const workflowFiles = readdirSync(workflowDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.ya?ml$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort();
+  let setupGoCount = 0;
+
+  // go.mod 是漏洞扫描、CI 构建和 Docker 发布的唯一 Go 版本源；漂移会把未修复的标准库带进成品。
+  for (const workflowFile of workflowFiles) {
+    const lines = readFileSync(join(workflowDir, workflowFile), "utf8").split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      const usesMatch = /^(?<indent>\s*)(?:-\s+)?uses:\s*actions\/setup-go@\S+\s*$/.exec(
+        lines[index],
+      );
+      if (!usesMatch?.groups) {
+        continue;
+      }
+
+      setupGoCount += 1;
+      const usesIndent = usesMatch.groups.indent.length;
+      let stepEnd = lines.length;
+      for (let candidate = index + 1; candidate < lines.length; candidate += 1) {
+        const nextStep = /^(?<indent>\s*)-\s+/.exec(lines[candidate]);
+        if (nextStep?.groups && nextStep.groups.indent.length <= usesIndent) {
+          stepEnd = candidate;
+          break;
+        }
+      }
+
+      const stepLines = lines.slice(index, stepEnd);
+      const versionFileValues = stepLines.flatMap((line) => {
+        const match = /^\s*go-version-file:\s*(?<value>.+?)\s*$/.exec(line);
+        return match?.groups ? [match.groups.value.replace(/^['"]|['"]$/g, "")] : [];
+      });
+      if (stepLines.some((line) => /^\s*go-version:\s*/.test(line))) {
+        throw new Error(`${workflowFile} setup-go step must not hardcode go-version.`);
+      }
+      if (
+        versionFileValues.length !== 1 ||
+        versionFileValues[0] !== "apps/docker-server/go.mod"
+      ) {
+        throw new Error(
+          `${workflowFile} setup-go step must use go-version-file: apps/docker-server/go.mod.`,
+        );
+      }
+    }
+  }
+
+  if (setupGoCount === 0) {
+    throw new Error("At least one GitHub Actions workflow must configure actions/setup-go.");
+  }
+}
+
 function checkDockerSelfUpdateLayout() {
   const dockerfile = readFileSync(join(repoRoot, "Dockerfile"), "utf8");
   const entrypoint = readFileSync(join(repoRoot, "deploy/docker-entrypoint.sh"), "utf8");
@@ -219,7 +297,7 @@ function checkDockerSelfUpdateLayout() {
     "uses: actions/github-script@v9.0.0",
     "item.draft && item.tag_name === tag",
     "github.rest.repos.deleteRelease",
-    "uses: softprops/action-gh-release@v3.0.0",
+    "uses: softprops/action-gh-release@v3.0.2",
     "fail_on_unmatched_files: true",
   ]) {
     if (!releaseWorkflow.includes(snippet)) {
@@ -287,12 +365,22 @@ function checkDockerProxyEnv() {
 
 function checkCloudflareDeployMigrationScript() {
   const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+  const workerPackageJson = JSON.parse(readFileSync(join(repoRoot, "apps/worker/package.json"), "utf8"));
   const deployScript = packageJson.scripts?.deploy;
   const deployCloudflareScript = packageJson.scripts?.["deploy:cloudflare"];
   const buildCloudflareScript = packageJson.scripts?.["build:cloudflare"];
   const devScript = packageJson.scripts?.["dev:cloudflare"];
+  const checkDeployScript = packageJson.scripts?.["check:deploy"];
   const migrationScript = packageJson.scripts?.["cloudflare:migrations:apply"];
+  const localMigrationScript = packageJson.scripts?.["cloudflare:migrations:apply:local"];
+  const routeParityScript = packageJson.scripts?.["check:route-parity"];
+  const buildAllScript = packageJson.scripts?.["build:all"];
+  const typecheckScript = packageJson.scripts?.typecheck;
+  const typecheckAllScript = packageJson.scripts?.["typecheck:all"];
+  const typecheckScriptsScript = packageJson.scripts?.["typecheck:scripts"];
+  const checkCloudflareScript = packageJson.scripts?.["check:cloudflare"];
   const queuesEnsureScript = packageJson.scripts?.["cloudflare:queues:ensure"];
+  const migrationRunnerScript = readFileSync(join(repoRoot, "scripts/apply-cloudflare-d1-migrations.mjs"), "utf8");
 
   // Deploy Button 和自管 Wrangler 部署都依赖这个顺序：先确认生产 headers，再迁移 D1/确保队列，最后更新 Worker。
   if (deployScript !== "node scripts/prepare-cloudflare-local-headers.mjs --check-production && pnpm cloudflare:migrations:apply && pnpm cloudflare:queues:ensure && wrangler deploy") {
@@ -301,17 +389,91 @@ function checkCloudflareDeployMigrationScript() {
   if (deployCloudflareScript !== "pnpm build:cloudflare && pnpm deploy") {
     throw new Error("package.json deploy:cloudflare must rebuild production Cloudflare assets before deploy.");
   }
-  if (buildCloudflareScript !== "VITE_RENEWLET_RUNTIME=cloudflare pnpm --filter @renewlet/client build") {
-    throw new Error("package.json build:cloudflare must keep the production client build without local HTTP header rewrites.");
+  if (buildCloudflareScript !== "VITE_RENEWLET_RUNTIME=cloudflare pnpm --filter @renewlet/client build && pnpm --filter @renewlet/cloudflare build") {
+    throw new Error("package.json build:cloudflare must build both production Static Assets and the Worker bundle without local HTTP header rewrites.");
   }
-  if (migrationScript !== "wrangler d1 migrations apply DB --remote") {
-    throw new Error("package.json cloudflare:migrations:apply must target the DB binding with remote D1 migrations.");
+  if (workerPackageJson.scripts?.build !== "wrangler deploy --dry-run --config ../../wrangler.jsonc --outdir dist") {
+    throw new Error("apps/worker build must produce a real Wrangler dry-run bundle from the root deployment config.");
+  }
+  if (checkDeployScript !== "node scripts/check-deploy-config.mjs && pnpm test:scripts") {
+    throw new Error("package.json check:deploy must include Cloudflare deployment helper tests.");
+  }
+  if (migrationScript !== "node scripts/apply-cloudflare-d1-migrations.mjs --remote") {
+    throw new Error("package.json cloudflare:migrations:apply must use the retry-aware remote D1 migration helper.");
+  }
+  if (localMigrationScript !== "node scripts/apply-cloudflare-d1-migrations.mjs --local") {
+    throw new Error("package.json cloudflare:migrations:apply:local must run migration, derived-state backfill, and foreign-key checks against local D1.");
+  }
+  if (routeParityScript !== "tsx scripts/check-product-route-parity.ts") {
+    throw new Error("package.json check:route-parity must compare the Go and Worker runtime registries.");
+  }
+  if (!buildAllScript?.includes("pnpm build:client") || !buildAllScript.includes("pnpm --filter @renewlet/cloudflare build") || !buildAllScript.includes("pnpm build:server") || !buildAllScript.includes("pnpm build:website")) {
+    throw new Error("package.json build:all must build client, Worker bundle, Go server, and website after shared/Worker typechecks.");
+  }
+  if (typecheckScript !== "pnpm typecheck:all") {
+    throw new Error("package.json typecheck must use the complete monorepo type gate.");
+  }
+  if (typecheckScriptsScript !== "tsc --noEmit --project tsconfig.json") {
+    throw new Error("package.json typecheck:scripts must compile every root TypeScript operations script.");
+  }
+  if (!typecheckAllScript?.includes("pnpm typecheck:scripts") || !typecheckAllScript.includes("pnpm --filter @renewlet/server typecheck")) {
+    throw new Error("package.json typecheck:all must include root scripts and Go vet through the Docker server workspace.");
+  }
+  if (!checkCloudflareScript?.includes("pnpm typecheck:scripts")) {
+    throw new Error("package.json check:cloudflare must typecheck the root Cloudflare operations scripts.");
   }
   if (queuesEnsureScript !== "node scripts/ensure-cloudflare-queues.mjs") {
     throw new Error("package.json cloudflare:queues:ensure must keep the idempotent Queue creation helper.");
   }
   if (devScript !== "pnpm build:cloudflare && node scripts/prepare-cloudflare-local-headers.mjs && pnpm cloudflare:migrations:apply:local && node scripts/cloudflare-dev-hint.mjs && node scripts/cloudflare-dev-wrangler.mjs --test-scheduled") {
-    throw new Error("package.json dev:cloudflare must prepare local HTTP headers, print the local Cron hint, inject local proxy settings for Wrangler, and enable Wrangler scheduled middleware.");
+    throw new Error("package.json dev:cloudflare must prepare local HTTP headers, print the local Cron hint, apply the explicit proxy policy, and enable Wrangler scheduled middleware.");
+  }
+  // D1 远端 migration 偶发 7429/reset 时可以重试；权限、SQL 和 binding 错误仍必须保持失败。
+  for (const snippet of [
+    "D1 DB storage operation exceeded timeout",
+    "\\[code:\\s*7429\\]",
+    "Network connection lost",
+    "A D1 target is required",
+    "options.target === \"local\"",
+    "backfill-cloudflare-subscription-derived-state.ts",
+    "PRAGMA foreign_key_check",
+    "invalid Wrangler JSON",
+    "found violations",
+    "non-retryable error",
+    "failed after",
+  ]) {
+    if (!migrationRunnerScript.includes(snippet)) {
+      throw new Error(`apply-cloudflare-d1-migrations.mjs must keep retry boundary snippet: ${snippet}`);
+    }
+  }
+}
+
+function checkCloudflareObservabilityProfiles() {
+  const generator = readFileSync(join(repoRoot, "scripts/generate-cloudflare-wrangler-config.mjs"), "utf8");
+  const template = readFileSync(join(repoRoot, "wrangler.jsonc"), "utf8");
+  const selfHostedWorkflow = readFileSync(join(repoRoot, ".github/workflows/cloudflare-worker.yml"), "utf8");
+  const releaseWorkflow = readFileSync(join(repoRoot, ".github/workflows/release-publish.yml"), "utf8");
+
+  // profile 由部署入口显式选择；模板/开发保持全采样，稳定发布必须降低日志与 trace 采样。
+  for (const snippet of [
+    '"CLOUDFLARE_OBSERVABILITY_PROFILE"',
+    "development: { logs: 1, traces: 1 }",
+    "production: { logs: 0.1, traces: 0.05 }",
+  ]) {
+    if (!generator.includes(snippet)) {
+      throw new Error(`Cloudflare config generator must keep observability profile snippet: ${snippet}`);
+    }
+  }
+  for (const snippet of ['"head_sampling_rate": 1', '"enabled": true']) {
+    if (!template.includes(snippet)) {
+      throw new Error(`wrangler.jsonc development observability must keep snippet: ${snippet}`);
+    }
+  }
+  if (!selfHostedWorkflow.includes("CLOUDFLARE_OBSERVABILITY_PROFILE: development")) {
+    throw new Error("Self-managed Cloudflare workflow must select the development observability profile.");
+  }
+  if (!releaseWorkflow.includes("CLOUDFLARE_OBSERVABILITY_PROFILE: production")) {
+    throw new Error("Stable Cloudflare release must select the production observability profile.");
   }
 }
 
@@ -462,6 +624,7 @@ function checkCloudflareDeployButtonVersionFallback() {
 }
 
 function checkCloudflareWorkflowBuildMetadata() {
+  checkCloudflareD1DeployContract(repoRoot);
   const selfHostedWorkflow = readFileSync(join(repoRoot, ".github/workflows/cloudflare-worker.yml"), "utf8");
   const releaseWorkflow = readFileSync(join(repoRoot, ".github/workflows/release-publish.yml"), "utf8");
 
@@ -485,6 +648,7 @@ function checkCloudflareWorkflowBuildMetadata() {
     "SHORT_SHA=\"${GITHUB_SHA::7}\"",
     "RENEWLET_VERSION=${PACKAGE_VERSION}-dev+${SHORT_SHA}",
     "RENEWLET_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "pnpm cloudflare:migrations:apply --config \"$CI_WRANGLER_CONFIG\"",
     "Ensure Cloudflare Queues",
     "pnpm cloudflare:queues:ensure",
   ]) {
@@ -497,6 +661,7 @@ function checkCloudflareWorkflowBuildMetadata() {
     "RENEWLET_VERSION: ${{ needs.metadata.outputs.version }}",
     "RENEWLET_COMMIT: ${{ github.sha }}",
     "RENEWLET_BUILD_TIME: ${{ steps.build-time.outputs.value }}",
+    "pnpm cloudflare:migrations:apply --config \"$CI_WRANGLER_CONFIG\"",
     "Ensure Cloudflare Queues",
     "pnpm cloudflare:queues:ensure",
   ]) {
@@ -592,10 +757,14 @@ function checkRuntimeReleaseSecretPathRemoved() {
 run("bash", ["-n", deployScript]);
 checkGeneratedSecrets();
 checkInvalidExistingPBKeyIsRejected();
+checkGoToolchainConsistency();
 checkDockerSelfUpdateLayout();
+checkDockerBuildContract(repoRoot);
 checkDockerCustomHeadScriptEnv();
 checkDockerProxyEnv();
 checkCloudflareDeployMigrationScript();
+checkCloudflareDevRunner(repoRoot);
+checkCloudflareObservabilityProfiles();
 checkCloudflareStaticAssetHeadersContract();
 checkCloudflareScheduledLocalRoute();
 checkCloudflareQueueConfig();

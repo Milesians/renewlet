@@ -1,4 +1,10 @@
-import type { ImportPayload, ImportSubscription, RenewletExportV1 } from "@/lib/api/schemas/import-export";
+import {
+  IMPORT_PREVIEW_MAX_BYTES,
+  IMPORT_PREVIEW_SUBSCRIPTION_LIMIT,
+  type ImportPayload,
+  type ImportSubscription,
+  type RenewletExportV1,
+} from "@/lib/api/schemas/import-export";
 import type { AppSettings, BillingCycle, CustomCycleUnit, Subscription } from "@/types/subscription";
 import type { ConfigItem, CustomConfig } from "@/types/config";
 import { labels } from "@/i18n/locales";
@@ -8,17 +14,25 @@ import { isValidDateOnly } from "@renewlet/shared/runtime";
 /**
  * 导入文件大小上限。
  *
- * JSON/ZIP/SQLite 解析都发生在浏览器端；50MiB 是为了允许 Wallos 备份带 Logo，同时避免主线程/Worker 被异常文件拖垮。
+ * JSON/ZIP/SQLite 解析都发生在浏览器端；8 MiB 上限与两个后端预览 body 契约保持一致。
  */
-export const MAX_IMPORT_FILE_BYTES = 50 * 1024 * 1024;
+export const MAX_IMPORT_FILE_BYTES = IMPORT_PREVIEW_MAX_BYTES;
+export const MAX_IMPORT_PREVIEW_SUBSCRIPTIONS = IMPORT_PREVIEW_SUBSCRIPTION_LIMIT;
+
+export type ImportAssetKind = "logo" | "icon";
+
+export type ImportAssetTarget =
+  | { type: "subscriptionLogo"; subscriptionIndex: number }
+  | { type: "paymentMethodIcon"; paymentMethodIndex: number };
 
 /**
- * ImportAssetRef 描述导入流程中尚未上传到 Renewlet 的 Logo 资产。
+ * ImportAssetRef 描述导入流程中尚未上传到 Renewlet 的私有资产。
  *
- * subscriptionIndex 绑定预览行，最终 apply 前会上传并改写 payload.logo 为 `/api/app/assets/{id}`。
+ * target 绑定最终要改写的 payload 字段；apply 前必须先落资产表，再写 `/api/app/assets/{id}` 代理路径。
  */
 export interface ImportAssetRef {
-  subscriptionIndex: number;
+  target: ImportAssetTarget;
+  kind: ImportAssetKind;
   filename: string;
   blob?: Blob;
   zipEntryName?: string;
@@ -69,15 +83,11 @@ export const IMPORT_MESSAGE_CODES = {
   onlyCurrencyId: "IMPORT_WARNING_WALLOS_CURRENCY_ID_ONLY",
   externalLogo: "IMPORT_WARNING_WALLOS_EXTERNAL_LOGO",
   unknownCycle: "IMPORT_WARNING_WALLOS_UNKNOWN_CYCLE",
+  fileTooLarge: "IMPORT_ERROR_FILE_TOO_LARGE",
   unrecognizedFile: "IMPORT_ERROR_UNRECOGNIZED_FILE",
   wallosTableTooLarge: "IMPORT_ERROR_WALLOS_TABLE_TOO_LARGE",
   workerParseFailed: "IMPORT_ERROR_WORKER_PARSE_FAILED",
   workerUnsupported: "IMPORT_ERROR_WORKER_UNSUPPORTED",
-  aiBillingCycleDefaulted: "IMPORT_WARNING_AI_BILLING_CYCLE_DEFAULTED",
-  aiCurrencyDefaulted: "IMPORT_WARNING_AI_CURRENCY_DEFAULTED",
-  aiCustomCycleDefaulted: "IMPORT_WARNING_AI_CUSTOM_CYCLE_DEFAULTED",
-  aiDateDefaulted: "IMPORT_WARNING_AI_DATE_DEFAULTED",
-  aiPriceDefaulted: "IMPORT_WARNING_AI_PRICE_DEFAULTED",
   aiWebsiteSuggested: "IMPORT_WARNING_AI_WEBSITE_SUGGESTED",
 } as const;
 
@@ -174,6 +184,7 @@ export function subscriptionToImportSubscription(subscription: Subscription, sou
     repeatReminderEnabled: subscription.repeatReminderEnabled,
     repeatReminderInterval: subscription.repeatReminderInterval,
     repeatReminderWindow: subscription.repeatReminderWindow,
+    costSharing: subscription.costSharing ?? null,
     extra,
   };
 }
@@ -212,6 +223,7 @@ export function subscriptionToExportRow(subscription: Subscription): RenewletExp
     repeatReminderEnabled: subscription.repeatReminderEnabled,
     repeatReminderInterval: subscription.repeatReminderInterval,
     repeatReminderWindow: subscription.repeatReminderWindow,
+    ...(subscription.costSharing ? { costSharing: subscription.costSharing } : {}),
     extra: subscription.extra ?? {},
   };
 }
@@ -315,7 +327,7 @@ export function toBillingCycleFromUnit(count: number, unit: CustomCycleUnit): Im
   return { billingCycle: "custom", customDays: normalizedCount, customCycleUnit: unit };
 }
 
-/** privateAssetIdFromLogo 只识别受控资产代理路径，外链 Logo 不参与 ZIP 资产导出。 */
+/** privateAssetIdFromLogo 只识别受控资产代理路径；历史命名保留，当前同时服务订阅 Logo 和支付方式 Icon。 */
 export function privateAssetIdFromLogo(value: string | undefined): string | null {
   const match = value?.match(/^\/api\/app\/assets\/([A-Za-z0-9_-]+)$/);
   return match?.[1] ?? null;

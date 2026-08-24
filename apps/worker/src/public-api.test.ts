@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { createDefaultAppSettings } from "@renewlet/shared/settings-defaults";
 import { describe, expect, it, vi } from "vitest";
 import { readSuccessData } from "./api-test-helpers";
+import { countSubscriptionStatuses } from "./subscription-derived-state";
 import { dateOnlyInZone } from "./subscription-renewal";
 import { sha256 } from "./crypto";
 import {
@@ -42,6 +43,7 @@ vi.mock("./crypto", async (importOriginal) => {
 type PublicApiTestState = {
   users: Array<{ id: string; banned: number }>;
   apiTokens: ApiTokenRow[];
+  apiTokenLastUsedUpdates: number;
   subscriptions: SubscriptionRow[];
   settingsJson: string | null;
 };
@@ -58,6 +60,7 @@ function createEnv(overrides: Partial<PublicApiTestState> = {}): Env & { __state
       { id: OTHER_USER_ID, banned: 0 },
     ],
     apiTokens: [],
+    apiTokenLastUsedUpdates: 0,
     subscriptions: [],
     settingsJson: JSON.stringify(settings),
     ...overrides,
@@ -102,20 +105,18 @@ class PublicApiTestStatement {
       const [userId, id] = this.values as [string, string];
       return this.state.subscriptions.find((row) => row.user_id === userId && row.id === id) as T | undefined ?? null;
     }
-    if (this.sql.includes("SELECT COUNT(*) AS count FROM subscriptions")) {
-      const userId = String(this.values[0]);
-      const count = this.state.subscriptions.filter((row) => row.user_id === userId).length;
-      return { count } as T;
-    }
     if (this.sql.includes("FROM subscription_user_stats")) {
       const userId = String(this.values[0]);
-      const statusCounts: Record<string, number> = { active: 0, trial: 0, paused: 0, cancelled: 0, expired: 0 };
       const rows = this.state.subscriptions.filter((row) => row.user_id === userId);
-      for (const row of rows) statusCounts[row.status] = (statusCounts[row.status] ?? 0) + 1;
+      const statusCounts = countSubscriptionStatuses(rows);
       return {
         user_id: userId,
         total_count: rows.length,
-        status_counts_json: JSON.stringify(statusCounts),
+        trial_count: statusCounts.trial,
+        active_count: statusCounts.active,
+        expired_count: statusCounts.expired,
+        paused_count: statusCounts.paused,
+        cancelled_count: statusCounts.cancelled,
         created_at: "2026-06-01T00:00:00.000Z",
         updated_at: "2026-06-01T00:00:00.000Z",
       } as T;
@@ -133,14 +134,6 @@ class PublicApiTestStatement {
         .filter((row) => row.user_id === userId)
         .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id));
       return d1Result(rows as T[]);
-    }
-    if (this.sql.includes("FROM subscriptions") && this.sql.includes("GROUP BY status")) {
-      const userId = String(this.values[0]);
-      const counts = new Map<string, number>();
-      for (const row of this.state.subscriptions.filter((item) => item.user_id === userId)) {
-        counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
-      }
-      return d1Result(Array.from(counts, ([status, count]) => ({ status, count })) as T[]);
     }
     if (this.sql.includes("FROM subscriptions") && this.sql.includes("next_billing_date >= ?")) {
       const [userId, today, through] = this.values as [string, string, string, string, string];
@@ -208,6 +201,7 @@ class PublicApiTestStatement {
       const [lastUsedAt, updatedAt, id] = this.values as [string, string, string];
       const token = this.state.apiTokens.find((row) => row.id === id);
       if (!token) return d1Result([], 0);
+      this.state.apiTokenLastUsedUpdates += 1;
       token.last_used_at = lastUsedAt;
       token.updated_at = updatedAt;
       return d1Result([], 1);
@@ -217,14 +211,18 @@ class PublicApiTestStatement {
 }
 
 function authorizedRequest(path: string, init: RequestInit = {}): Request {
+  const method = init.method ?? "GET";
+  const unsafe = !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
   return new Request(`https://renewlet.test${path}`, {
+    ...init,
+    method,
     headers: {
-      authorization: "Bearer session-token",
+      cookie: "renewlet_session=session-token; renewlet_csrf=csrf-token",
       "content-type": "application/json",
       "x-renewlet-locale": "en-US",
+      ...(unsafe ? { origin: "https://renewlet.test", "x-renewlet-csrf": "csrf-token" } : {}),
       ...init.headers,
     },
-    ...init,
   });
 }
 
@@ -252,7 +250,7 @@ function subscriptionRow(overrides: Partial<SubscriptionRow> = {}): Subscription
     user_id: USER_ID,
     name: "Public API Plan",
     logo: null,
-    price: 12,
+    price: "12",
     currency: "USD",
     billing_cycle: "monthly",
     custom_days: null,
@@ -276,6 +274,9 @@ function subscriptionRow(overrides: Partial<SubscriptionRow> = {}): Subscription
     repeat_reminder_enabled: 0,
     repeat_reminder_interval: "1h",
     repeat_reminder_window: "72h",
+    cost_sharing_json: "{}",
+    cost_sharing_collection_reminder_enabled: 0,
+    cost_sharing_next_collection_reminder_date: null,
     extra_json: "{}",
     created_at: "2026-06-20T00:00:00.000Z",
     updated_at: "2026-06-20T00:00:00.000Z",
@@ -335,7 +336,7 @@ describe("Cloudflare Public API", () => {
         }),
       ],
     });
-    authMocks.requireAuth.mockResolvedValue({ user: { id: USER_ID }, session: { id: "ses" }, token: "session-token" });
+    authMocks.requireAuth.mockResolvedValue({ user: { id: USER_ID }, session: { id: "ses" } });
 
     await expect(createApiToken(authorizedRequest("/api/app/api-tokens", {
       method: "POST",
@@ -406,15 +407,49 @@ describe("Cloudflare Public API", () => {
     expect(dueBody.items.find((item) => item.subscription.id === "sub_renewal")?.subscription.startDate).toBeNull();
     expect(dueBody.items.map((item) => item.subscription.id)).not.toContain("sub_other");
 
-    authMocks.requireAuth.mockResolvedValueOnce({ user: { id: OTHER_USER_ID }, session: { id: "ses_other" }, token: "session-token" });
+    authMocks.requireAuth.mockResolvedValueOnce({ user: { id: OTHER_USER_ID }, session: { id: "ses_other" } });
     await expect(deleteApiToken(authorizedRequest(`/api/app/api-tokens/${created.token.id}`, { method: "DELETE" }), env, created.token.id))
       .rejects.toMatchObject({ status: 404 });
     expect(env.__state.apiTokens).toHaveLength(1);
 
-    authMocks.requireAuth.mockResolvedValue({ user: { id: USER_ID }, session: { id: "ses" }, token: "session-token" });
+    authMocks.requireAuth.mockResolvedValue({ user: { id: USER_ID }, session: { id: "ses" } });
     const deleteResponse = await deleteApiToken(authorizedRequest(`/api/app/api-tokens/${created.token.id}`, { method: "DELETE" }), env, created.token.id);
     expect(deleteResponse.status).toBe(200);
     expect(env.__state.apiTokens).toHaveLength(0);
     await expect(publicApiMe(publicRequest("/api/public/v1/me"), env)).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("throttles public API last_used_at writes", async () => {
+    const tokenHash = await sha256(PLAIN_TOKEN);
+    const token: ApiTokenRow = {
+      id: "tok_existing",
+      user_id: USER_ID,
+      name: "Automation",
+      token_hash: tokenHash,
+      token_prefix: PLAIN_TOKEN.slice(0, 12),
+      scopes_json: JSON.stringify(["read"]),
+      last_used_at: null,
+      created_at: "2026-06-01T00:00:00.000Z",
+      updated_at: "2026-06-01T00:00:00.000Z",
+    };
+    const env = createEnv({ apiTokens: [token] });
+
+    const first = await publicApiMe(publicRequest("/api/public/v1/me"), env);
+    expect(first.status).toBe(200);
+    expect(env.__state.apiTokenLastUsedUpdates).toBe(1);
+    const firstLastUsedAt = token.last_used_at;
+    expect(firstLastUsedAt).toBeTruthy();
+
+    const fresh = await publicApiMe(publicRequest("/api/public/v1/me"), env);
+    expect(fresh.status).toBe(200);
+    expect(env.__state.apiTokenLastUsedUpdates).toBe(1);
+    expect(token.last_used_at).toBe(firstLastUsedAt);
+
+    const staleLastUsedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    token.last_used_at = staleLastUsedAt;
+    const stale = await publicApiMe(publicRequest("/api/public/v1/me"), env);
+    expect(stale.status).toBe(200);
+    expect(env.__state.apiTokenLastUsedUpdates).toBe(2);
+    expect(Date.parse(token.last_used_at ?? "")).toBeGreaterThan(Date.parse(staleLastUsedAt));
   });
 });

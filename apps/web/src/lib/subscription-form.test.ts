@@ -3,9 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   getTagsValidationError,
   getSubscriptionDraftValidationError,
+  getSubscriptionFormValidationIssues,
   isOptionalHttpUrl,
   normalizeTagsArray,
-  parseNonNegativeFiniteNumberInput,
+  parseMoneyInput,
   parseNonNegativeIntegerInput,
   parseTagsInput,
   toSubscriptionDraft,
@@ -43,15 +44,17 @@ describe("subscription-form", () => {
   });
 
   it("rejects loose numeric prefixes, Infinity, NaN and negative prices", () => {
-    expect(parseNonNegativeFiniteNumberInput("0")).toBe(0);
-    expect(parseNonNegativeFiniteNumberInput("0.00")).toBe(0);
-    expect(parseNonNegativeFiniteNumberInput("12.5")).toBe(12.5);
-    expect(parseNonNegativeFiniteNumberInput(".5")).toBe(0.5);
-    expect(parseNonNegativeFiniteNumberInput("12abc")).toBeNull();
-    expect(parseNonNegativeFiniteNumberInput("Infinity")).toBeNull();
-    expect(parseNonNegativeFiniteNumberInput("NaN")).toBeNull();
-    expect(parseNonNegativeFiniteNumberInput("-1")).toBeNull();
-    expect(parseNonNegativeFiniteNumberInput("1000000001")).toBeNull();
+    expect(parseMoneyInput("0")).toBe("0");
+    expect(parseMoneyInput("0.00")).toBe("0");
+    expect(parseMoneyInput("12.5")).toBe("12.5");
+    expect(parseMoneyInput(".5")).toBe("0.5");
+    expect(parseMoneyInput("12abc")).toBeNull();
+    expect(parseMoneyInput("Infinity")).toBeNull();
+    expect(parseMoneyInput("NaN")).toBeNull();
+    expect(parseMoneyInput("-1")).toBeNull();
+    expect(parseMoneyInput("1000000001")).toBeNull();
+    expect(parseMoneyInput("1.0000001")).toBeNull();
+    expect(parseMoneyInput("1e3")).toBeNull();
   });
 
   it("accepts only integer reminder/custom day inputs", () => {
@@ -85,6 +88,31 @@ describe("subscription-form", () => {
     expect(toSubscriptionDraft(form)).toBeNull();
   });
 
+  it("returns ordered validation issues with stable codes and UI fields", () => {
+    const form = createSubscriptionFormState({
+      name: "",
+      price: "invalid",
+      billingCycle: "custom",
+      customDays: "",
+      startDate: undefined,
+      nextBillingDate: undefined,
+      reminderType: "custom",
+      customReminderDays: "invalid",
+      website: "ftp://example.com",
+      tags: ["x".repeat(41)],
+    });
+
+    expect(getSubscriptionFormValidationIssues(form).map(({ code, field }) => ({ code, field }))).toEqual([
+      { code: "nameRequired", field: "name" },
+      { code: "amountInvalid", field: "price" },
+      { code: "nextBillingDateRequired", field: "dates" },
+      { code: "reminderInvalid", field: "reminderDays" },
+      { code: "customCycleInvalid", field: "customDays" },
+      { code: "websiteInvalid", field: "website" },
+      { code: "tagTooLong", field: "tags" },
+    ]);
+  });
+
   it("builds a draft for zero-price services", () => {
     const form = createSubscriptionFormState({
       name: "Free service",
@@ -93,7 +121,7 @@ describe("subscription-form", () => {
       nextBillingDate: assertDateOnly("2026-02-01"),
     });
 
-    expect(toSubscriptionDraft(form)).toMatchObject({ price: 0 });
+    expect(toSubscriptionDraft(form)).toMatchObject({ price: "0" });
   });
 
   it("rejects renewal dates before the start date", () => {
@@ -137,7 +165,7 @@ describe("subscription-form", () => {
     });
 
     expect(toSubscriptionDraft(valid)).toMatchObject({
-      price: 19.99,
+      price: "19.99",
       customDays: 45,
       customCycleUnit: "year",
       reminderDays: 0,
@@ -343,8 +371,136 @@ describe("subscription-form", () => {
         enabled: true,
         splitMode: "custom",
         members: [
-          { id: "partner", name: "Partner", currency: "USD", customAmount: 40 },
-          { id: "child", name: "Child", currency: "CNY", customAmount: 420 },
+          { id: "partner", name: "Partner", currency: "USD", customAmount: "40" },
+          { id: "child", name: "Child", currency: "CNY", customAmount: "420" },
+        ],
+      },
+    });
+
+    expect(getSubscriptionDraftValidationError(form)).toBeNull();
+    expect(toSubscriptionDraft(form)?.costSharing).toEqual(form.costSharing);
+  });
+
+  it("keeps valid cost sharing collection reminder settings in the draft", () => {
+    const form = createSubscriptionFormState({
+      name: "Family Plan",
+      price: "100",
+      currency: "USD",
+      startDate: assertDateOnly("2026-01-01"),
+      nextBillingDate: assertDateOnly("2026-02-01"),
+      costSharing: {
+        enabled: true,
+        splitMode: "equal",
+        collectionReminder: { enabled: true, reminderDays: -1 },
+        members: [
+          { id: "partner", name: "Partner", currency: "USD" },
+        ],
+      },
+    });
+
+    expect(getSubscriptionDraftValidationError(form)).toBeNull();
+    expect(toSubscriptionDraft(form)?.costSharing).toEqual(form.costSharing);
+  });
+
+  it("rejects collection reminders for one-time buyout drafts", () => {
+    const form = createSubscriptionFormState({
+      name: "Lifetime Family Plan",
+      price: "100",
+      currency: "USD",
+      billingCycle: "one-time",
+      oneTimeMode: "buyout",
+      startDate: assertDateOnly("2026-01-01"),
+      nextBillingDate: undefined,
+      costSharing: {
+        enabled: true,
+        splitMode: "equal",
+        collectionReminder: { enabled: true, reminderDays: -1 },
+        members: [
+          { id: "partner", name: "Partner", currency: "USD" },
+        ],
+      },
+    });
+
+    expect(getSubscriptionDraftValidationError(form)).toBe("长期有效的一次性购买不支持收款提醒");
+    expect(toSubscriptionDraft(form)).toBeNull();
+  });
+
+  it("rejects disabled reminder sentinel for cost sharing collection reminders", () => {
+    const form = createSubscriptionFormState({
+      name: "Family Plan",
+      price: "100",
+      currency: "USD",
+      startDate: assertDateOnly("2026-01-01"),
+      nextBillingDate: assertDateOnly("2026-02-01"),
+      costSharing: {
+        enabled: true,
+        splitMode: "equal",
+        collectionReminder: { enabled: true, reminderDays: -2 },
+        members: [
+          { id: "partner", name: "Partner", currency: "USD" },
+        ],
+      },
+    });
+
+    expect(getSubscriptionDraftValidationError(form)).toBe("收款提醒天数必须是继承默认值或 0 到 3650 之间的整数");
+    expect(toSubscriptionDraft(form)).toBeNull();
+  });
+
+  it("requires member joined dates when collection reminders have no subscription start date", () => {
+    const form = createSubscriptionFormState({
+      name: "Family Plan",
+      price: "100",
+      currency: "USD",
+      startDate: undefined,
+      nextBillingDate: assertDateOnly("2026-02-01"),
+      costSharing: {
+        enabled: true,
+        splitMode: "equal",
+        collectionReminder: { enabled: true, reminderDays: -1 },
+        members: [
+          { id: "partner", name: "Partner", currency: "USD" },
+        ],
+      },
+    });
+
+    expect(getSubscriptionDraftValidationError(form)).toBe("请为成员设置上车日期，或先填写订阅开始日期");
+    expect(toSubscriptionDraft(form)).toBeNull();
+  });
+
+  it("rejects member joined dates outside the subscription date range", () => {
+    const form = createSubscriptionFormState({
+      name: "Family Plan",
+      price: "100",
+      currency: "USD",
+      startDate: assertDateOnly("2026-01-01"),
+      nextBillingDate: assertDateOnly("2026-02-01"),
+      costSharing: {
+        enabled: true,
+        splitMode: "equal",
+        collectionReminder: { enabled: true, reminderDays: -1 },
+        members: [
+          { id: "partner", name: "Partner", currency: "USD", joinedDate: assertDateOnly("2026-02-02") },
+        ],
+      },
+    });
+
+    expect(getSubscriptionDraftValidationError(form)).toBe("成员上车日期必须在订阅日期范围内");
+    expect(toSubscriptionDraft(form)).toBeNull();
+  });
+
+  it("accepts member joined dates as collection reminder anchors", () => {
+    const form = createSubscriptionFormState({
+      name: "Family Plan",
+      price: "100",
+      currency: "USD",
+      startDate: undefined,
+      nextBillingDate: assertDateOnly("2026-02-01"),
+      costSharing: {
+        enabled: true,
+        splitMode: "equal",
+        collectionReminder: { enabled: true, reminderDays: 0 },
+        members: [
+          { id: "partner", name: "Partner", currency: "USD", joinedDate: assertDateOnly("2026-01-01") },
         ],
       },
     });
@@ -364,8 +520,8 @@ describe("subscription-form", () => {
         enabled: true,
         splitMode: "custom",
         members: [
-          { id: "partner", name: "Partner", currency: "USD", customAmount: 40 },
-          { id: "child", name: "Child", currency: "USD", customAmount: 50 },
+          { id: "partner", name: "Partner", currency: "USD", customAmount: "40" },
+          { id: "child", name: "Child", currency: "USD", customAmount: "50" },
         ],
       },
     });

@@ -3,6 +3,11 @@ import { afterEach, beforeEach, vi } from "vitest";
 import { DEFAULT_CUSTOM_CONFIG, type CustomConfig } from "@/types/config";
 import { DEFAULT_SETTINGS, type AppSettings } from "@/types/subscription";
 import { BUILT_IN_ICON_PROVIDERS, type BuiltInIconProvider } from "@renewlet/shared/built-in-icons";
+import {
+  applySettingsSecretUpdates,
+  appSettingsSecretStatus,
+  type SettingsSecretUpdates,
+} from "@renewlet/shared/schemas/settings";
 import type { BuiltInIconIndexStatus } from "@/lib/api/schemas/media";
 import {
   APPEARANCE_PENDING_STORAGE_KEY,
@@ -15,6 +20,8 @@ export const BASE_SETTINGS: AppSettings = {
   ...DEFAULT_SETTINGS,
   recipientEmail: "alice@example.com",
 };
+
+type SettingsMutationCommand = { patch: AppSettings; secretUpdates: SettingsSecretUpdates };
 
 function providerStatusFixtures(counts: Record<BuiltInIconProvider, number>) {
   return BUILT_IN_ICON_PROVIDERS.map((provider) => ({
@@ -40,9 +47,10 @@ function providerStatusFixtures(counts: Record<BuiltInIconProvider, number>) {
 
 const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
-  updateSettingsMutateAsync: vi.fn(),
+  updateSettingsMutateAsync: vi.fn<(command: SettingsMutationCommand) => Promise<unknown>>(),
   refreshRates: vi.fn(),
   remoteSettings: undefined as unknown,
+  remoteSecretStatus: undefined as unknown,
   customConfig: undefined as unknown,
   saveConfig: vi.fn(),
   setTheme: vi.fn(),
@@ -71,6 +79,11 @@ const mocks = vi.hoisted(() => ({
     isLoading: false,
     refetch: vi.fn(),
   },
+  authSecuritySettings: { data: { turnstile: { enabled: false, siteKey: "", secretConfigured: false } }, isLoading: false },
+  updateAuthSecurityMutateAsync: vi.fn(),
+  updateAuthSecurityIsPending: false,
+  testAuthSecurityTurnstileMutateAsync: vi.fn(),
+  testAuthSecurityTurnstileIsPending: false,
   checkBuiltInIconIndexProviderMutateAsync: vi.fn(),
   checkBuiltInIconIndexProviderIsPending: false,
   refreshBuiltInIconIndexProviderMutateAsync: vi.fn(),
@@ -80,8 +93,15 @@ const mocks = vi.hoisted(() => ({
   openWindow: vi.fn(),
   isCloudflareRuntime: false,
   accountIdentity: { email: "alice@example.com" as string | null, role: "admin", banned: false },
-  appStatus: { setupRequired: false, setupEnabled: true, demoMode: false, isLoading: false },
+  appStatus: { setupRequired: false, setupEnabled: true, demoMode: false, turnstile: { enabled: false, siteKey: "" }, isLoading: false },
 }));
+
+function settingsMutationResult(command: SettingsMutationCommand) {
+  const persisted = applySettingsSecretUpdates(command.patch, command.secretUpdates);
+  const secretStatus = appSettingsSecretStatus(persisted);
+  mocks.remoteSecretStatus = secretStatus;
+  return { settings: command.patch, secretStatus };
+}
 
 vi.mock("@/hooks/use-toast", () => ({
   useToast: () => ({
@@ -90,8 +110,11 @@ vi.mock("@/hooks/use-toast", () => ({
 }));
 
 vi.mock("@/hooks/use-settings", () => ({
-  useSettings: () => ({
-    data: mocks.remoteSettings,
+  useSettingsEnvelope: () => ({
+    data: {
+      settings: mocks.remoteSettings,
+      secretStatus: mocks.remoteSecretStatus,
+    },
   }),
   useUpdateSettings: () => ({
     mutateAsync: mocks.updateSettingsMutateAsync,
@@ -102,19 +125,32 @@ vi.mock("@/hooks/use-setup-status", () => ({
   useSetupStatus: () => mocks.appStatus,
 }));
 
-vi.mock("@/hooks/use-exchange-rates", () => ({
-	  useExchangeRates: () => ({
-	    rates: {},
-	    activeProvider: "frankfurter",
-	    loading: false,
-	    lastUpdated: null,
-	    refresh: mocks.refreshRates,
-	    error: null,
-	    errorDetails: null,
-	    warning: null,
-	    getCurrencySymbol: () => "¥",
-	  }),
-	}));
+vi.mock("@/hooks/use-auth-security", () => ({
+  useAuthSecuritySettings: () => mocks.authSecuritySettings,
+  useUpdateAuthSecuritySettings: () => ({
+    mutateAsync: mocks.updateAuthSecurityMutateAsync,
+    isPending: mocks.updateAuthSecurityIsPending,
+  }),
+  useTestAuthSecurityTurnstile: () => ({
+    mutateAsync: mocks.testAuthSecurityTurnstileMutateAsync,
+    isPending: mocks.testAuthSecurityTurnstileIsPending,
+  }),
+}));
+
+vi.mock("@/hooks/use-report-exchange-rates", () => ({
+  useReportExchangeRates: () => ({
+    rates: {},
+    activeProvider: "frankfurter",
+    loading: false,
+    lastUpdated: null,
+    refresh: mocks.refreshRates,
+    error: null,
+    errorDetails: null,
+    warning: null,
+    reportBasisStatus: { month: "2026-08", locked: true, sourceDate: "2026-08-01", capturedAt: "2026-08-06T00:00:00Z" },
+    getCurrencySymbol: () => "¥",
+  }),
+}));
 
 vi.mock("@/hooks/use-subscriptions", () => ({
   useSubscriptions: () => ({
@@ -380,6 +416,8 @@ export function setupSettingsFormControllerTestEnvironment() {
     mocks.checkBuiltInIconIndexProviderIsPending = false;
     mocks.refreshBuiltInIconIndexProviderMutateAsync.mockReset();
     mocks.refreshBuiltInIconIndexProviderIsPending = false;
+    mocks.updateAuthSecurityMutateAsync.mockReset();
+    mocks.updateAuthSecurityIsPending = false;
     mocks.writeClipboard.mockReset();
     mocks.fetch.mockReset();
     mocks.openWindow.mockReset();
@@ -405,11 +443,22 @@ export function setupSettingsFormControllerTestEnvironment() {
       refetch: vi.fn(),
     };
     mocks.remoteSettings = BASE_SETTINGS;
+    mocks.remoteSecretStatus = appSettingsSecretStatus(BASE_SETTINGS);
     mocks.customConfig = DEFAULT_CUSTOM_CONFIG;
     mocks.isCloudflareRuntime = false;
     mocks.accountIdentity = { email: "alice@example.com", role: "admin", banned: false };
-    mocks.appStatus = { setupRequired: false, setupEnabled: true, demoMode: false, isLoading: false };
-    mocks.updateSettingsMutateAsync.mockImplementation(async (settings: AppSettings) => settings);
+    mocks.appStatus = { setupRequired: false, setupEnabled: true, demoMode: false, turnstile: { enabled: false, siteKey: "" }, isLoading: false };
+    mocks.authSecuritySettings = { data: { turnstile: { enabled: false, siteKey: "", secretConfigured: false } }, isLoading: false };
+    mocks.updateSettingsMutateAsync.mockImplementation(async (command: SettingsMutationCommand) => settingsMutationResult(command));
+    mocks.updateAuthSecurityMutateAsync.mockImplementation(async (body: { turnstile: { enabled: boolean; siteKey: string; secret?: string } }) => ({
+      turnstile: {
+        enabled: body.turnstile.enabled,
+        siteKey: body.turnstile.siteKey,
+        secretConfigured: body.turnstile.secret !== "",
+      },
+    }));
+    mocks.testAuthSecurityTurnstileMutateAsync.mockResolvedValue({ verified: true });
+    mocks.testAuthSecurityTurnstileIsPending = false;
     mocks.saveConfig.mockImplementation(async (config: CustomConfig) => config);
     mocks.refreshRates.mockResolvedValue(undefined);
     mocks.createCalendarFeedMutateAsync.mockResolvedValue({

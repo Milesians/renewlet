@@ -15,7 +15,6 @@ import {
   mockMobile,
   renderDialog,
 } from "./ai-recognize-subscription-dialog.test-utils";
-
 const mocks = vi.hoisted(() => ({
   recognizeSubscriptionsStream: vi.fn(),
   previewPrepared: vi.fn(),
@@ -528,6 +527,10 @@ describe("AIRecognizeSubscriptionDialog", () => {
 
     await user.click(screen.getAllByRole("button", { name: "使用当前值" })[0]!);
     await waitFor(() => expect(screen.queryByText("请确认货币。")).not.toBeInTheDocument());
+    expect(screen.getAllByText("请确认扣费周期。").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "生成导入预览" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "使用当前值" }));
+    await waitFor(() => expect(screen.queryByText("请确认扣费周期。")).not.toBeInTheDocument());
     expect(screen.getByRole("button", { name: "生成导入预览" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "生成导入预览" }));
 
@@ -775,7 +778,7 @@ describe("AIRecognizeSubscriptionDialog", () => {
 
     await waitFor(() => expect(mocks.previewPrepared).toHaveBeenCalledTimes(1));
     const prepared = mocks.previewPrepared.mock.calls[0]?.[0] as PreparedImport;
-    expect(prepared.payload.subscriptions[0]?.price).toBe(66);
+    expect(prepared.payload.subscriptions[0]?.price).toBe("66");
     expect(prepared.payload.customConfig?.categories.some((item) => item.labels["zh-CN"] === "Cloud lab")).toBe(true);
     expect(prepared.payload.customConfig?.paymentMethods.some((item) => item.labels["zh-CN"] === "Personal card")).toBe(true);
   });

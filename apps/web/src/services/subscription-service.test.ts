@@ -18,7 +18,6 @@ vi.mock("@/lib/pocketbase", () => ({
     beforeSend: undefined,
   },
   getCurrentUserId: mocks.getCurrentUserId,
-  getAuthHeader: vi.fn(() => ({})),
 }));
 
 const legacyPocketBaseRow = {
@@ -27,7 +26,7 @@ const legacyPocketBaseRow = {
   id: "sub_legacy",
   name: "Perplexity Pro",
   logo: "https://example.com/perplexity.svg",
-  price: 20,
+  price: "20",
   currency: "USD",
   billingCycle: "monthly",
   customDays: 0,
@@ -55,7 +54,7 @@ const legacyPocketBaseRow = {
 const apiSubscription = {
   id: "sub_api",
   name: "API Subscription",
-  price: 12,
+  price: "12",
   currency: "USD",
   billingCycle: "monthly",
   category: "productivity",
@@ -131,13 +130,13 @@ describe("subscription service normalization", () => {
   it("passes the current-user-payer cost sharing shape through the service boundary", () => {
     const subscription = fromApiSubscription({
       ...apiSubscription,
-      price: 100,
+      price: "100",
       costSharing: {
         enabled: true,
         splitMode: "custom",
         members: [
-          { id: "partner", name: "Partner", customAmount: 40 },
-          { id: "child", name: "Child", customAmount: 60 },
+          { id: "partner", name: "Partner", customAmount: "40" },
+          { id: "child", name: "Child", customAmount: "60" },
         ],
       },
     });
@@ -267,14 +266,22 @@ describe("subscription service API calls", () => {
     expect(payload).not.toHaveProperty("nextBillingDate");
   });
 
-  it("renews with an explicit empty JSON object and deletes through the product API", async () => {
+  it("renews with an explicit payload and deletes through the product API", async () => {
     mocks.apiFetch.mockResolvedValueOnce({ subscription: apiSubscription }).mockResolvedValueOnce({});
+    const renewPayload = {
+      mode: "continue",
+      price: "15",
+      currency: "USD",
+      startDate: null,
+      nextBillingDate: "2026-03-01",
+      autoCalculateNextBillingDate: false,
+    } as const;
 
-    await subscriptionService.renew("sub_api");
+    await subscriptionService.renew("sub_api", renewPayload);
     await subscriptionService.delete("sub_api");
 
     expect(mocks.apiFetch.mock.calls[0]?.[0]).toBe("/api/app/subscriptions/sub_api/renew");
-    expect(mocks.apiFetch.mock.calls[0]?.[2]).toMatchObject({ method: "POST", body: "{}" });
+    expect(mocks.apiFetch.mock.calls[0]?.[2]).toMatchObject({ method: "POST", body: JSON.stringify(renewPayload) });
     expect(mocks.apiFetch.mock.calls[1]?.[0]).toBe("/api/app/subscriptions/sub_api");
     expect(mocks.apiFetch.mock.calls[1]?.[2]).toMatchObject({ method: "DELETE" });
   });

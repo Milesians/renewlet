@@ -2,7 +2,7 @@
  * 统计分析页（/statistics）。
  *
  * 功能：
- * - 月度/年度支出汇总（使用实时汇率换算到默认币种）
+ * - 月度/年度支出汇总（使用当前月报表汇率口径换算到默认币种）
  * - 预算使用情况（与 Settings 中 monthlyBudget 对齐）
  * - 分类分布 / 支付方式分布图表
  *
@@ -10,13 +10,14 @@
  * - 统计聚合由 `useStatisticsModel` 完成。
  * - 页面只负责图表/卡片渲染和汇率刷新入口。
  *
- * 注意： 统计口径依赖订阅 domain 类型、Settings.defaultCurrency 和 USD base 汇率；
+ * 注意： 统计口径依赖订阅 domain 类型、Settings.defaultCurrency 和 USD base 月度快照；
  * 修改其中任一处都要同步首页统计、SpendingChart 和导出逻辑。
  */
 
 import { useCallback, useMemo, useState } from 'react';
 import type { Subscription } from '@/types/subscription';
 import { EditSubscriptionDialog } from '@/components/edit-subscription-dialog';
+import { RenewSubscriptionDialog } from '@/components/renew-subscription-dialog';
 import { Header } from '@/components/header';
 import { StatisticsPageSkeleton } from '@/components/loading-skeleton';
 import { RechartsFrame } from '@/components/recharts-frame';
@@ -25,7 +26,8 @@ import { StatisticsTrendChart } from '@/components/statistics-trend-chart';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip } from 'recharts';
 import { CircleHelp, RefreshCw } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useExchangeRates } from '@/hooks/use-exchange-rates';
+import { useReportExchangeRates } from '@/hooks/use-report-exchange-rates';
+import { moneyToNumber } from "@renewlet/shared/money";
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -35,8 +37,9 @@ import { useCustomConfig } from '@/contexts/CustomConfigContext';
 import { useStatisticsModel } from '@/modules/subscriptions/application/use-statistics-model';
 import { useSubscriptionCrud } from '@/modules/subscriptions/application/use-subscription-crud';
 import { collectSubscriptionTags } from '@/modules/subscriptions/domain/subscription-filters';
+import { resolveSubscriptionPriceReferenceCurrency } from '@/modules/subscriptions/domain/subscription-price-reference';
 import { useI18n } from '@/i18n/I18nProvider';
-import { useDeferredDialogCleanup } from '@/hooks/use-deferred-dialog-cleanup';
+import { useSubscriptionDetailDialog } from '@/hooks/use-subscription-detail-dialog';
 import { todayDateOnlyInTimeZone } from '@/lib/time/date-only';
 
 /** 空订阅数组：用于在数据未加载完成时提供稳定引用，避免 useMemo 依赖抖动。 */
@@ -104,9 +107,9 @@ const StatBox = ({ value, label, icon, variant = 'default', description }: StatB
 
   return (
     <div className="min-w-0 rounded-xl border border-border bg-card p-5 flex flex-col items-center justify-center text-center transition-all hover:bg-card-hover hover:shadow-lg">
-      <p className={cn("max-w-full break-words text-2xl sm:text-3xl font-bold", valueColor)}>{value}</p>
+      <p className={cn("max-w-full wrap-break-word text-2xl sm:text-3xl font-bold", valueColor)}>{value}</p>
       <div className="mt-1 flex max-w-full items-center justify-center gap-1 text-sm text-muted-foreground">
-        <span className="min-w-0 break-words">{label}</span>
+        <span className="min-w-0 wrap-break-word">{label}</span>
         {description ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -136,49 +139,41 @@ const Statistics = () => {
   const settingsQuery = useSettings();
   const settings = settingsQuery.data;
   const { config } = useCustomConfig();
-  const monthlyBudget = settings?.monthlyBudget ?? 0;
+  const monthlyBudget = settings?.monthlyBudget ?? "0";
+  const monthlyBudgetAmount = moneyToNumber(monthlyBudget);
   const defaultCurrency = settings?.defaultCurrency ?? "CNY";
+  const priceReferenceCurrency = settings ? resolveSubscriptionPriceReferenceCurrency(settings) : null;
   const timeZone = settings?.timezone ?? "UTC";
   const { locale, t, formatCurrency, formatDateTime, formatNumber } = useI18n();
   const [personalCostBasis, setPersonalCostBasis] = useState(false);
-  const [detailSubscriptionId, setDetailSubscriptionId] = useState<string | null>(null);
-  const [detailDialogOpen, setDetailDialogOpen] = useState(false);
 
-  const { convert, loading: ratesLoading, refresh: refreshRates, lastUpdated, error: ratesError } = useExchangeRates(settings?.exchangeRateProvider);
+  const { convert, loading: ratesLoading, refresh: refreshRates, lastUpdated, error: ratesError, sourceDate: ratesSourceDate } = useReportExchangeRates(settings?.exchangeRateProvider);
+  const currencyRatesReady = Boolean(ratesSourceDate) && !ratesLoading;
   const stats = useStatisticsModel(subscriptions, config, monthlyBudget, defaultCurrency, convert, timeZone, locale, personalCostBasis ? "personal" : "total");
   const {
     editingSubscription,
     editDialogOpen,
+    renewingSubscription,
+    renewDialogOpen,
+    renewError,
+    renewSubmitting,
+    renewRestoreFocusRef,
     handleAddSubscription,
     handleEditSubscription,
     handleRenewSubscription,
+    handleSubmitRenewSubscription,
     handleSaveSubscription,
     handleEditDialogOpenChange,
+    handleRenewDialogOpenChange,
   } = useSubscriptionCrud(subscriptions);
   const availableTags = useMemo(() => collectSubscriptionTags(subscriptions), [subscriptions]);
-  const selectedDetailSubscription = useMemo(
-    () => subscriptions.find((item) => item.id === detailSubscriptionId) ?? null,
-    [detailSubscriptionId, subscriptions],
-  );
   const today = useMemo(() => todayDateOnlyInTimeZone(new Date(), timeZone), [timeZone]);
-  const { scheduleCleanup: scheduleDetailCleanup, cancelCleanup: cancelDetailCleanup } =
-    useDeferredDialogCleanup(() => {
-      // 详情弹窗关闭动画期间仍要保留内容快照，避免 Dialog/Drawer fade-out 时标题和备注闪空。
-      setDetailSubscriptionId(null);
-    });
-  const handleViewTrendSubscriptionDetails = useCallback((id: string) => {
-    cancelDetailCleanup();
-    setDetailSubscriptionId(id);
-    setDetailDialogOpen(true);
-  }, [cancelDetailCleanup]);
-  const handleDetailDialogOpenChange = useCallback((nextOpen: boolean) => {
-    setDetailDialogOpen(nextOpen);
-    if (nextOpen) {
-      cancelDetailCleanup();
-      return;
-    }
-    scheduleDetailCleanup();
-  }, [cancelDetailCleanup, scheduleDetailCleanup]);
+  const {
+    detailDialogOpen,
+    selectedDetailSubscription,
+    handleViewDetails: handleViewTrendSubscriptionDetails,
+    handleDetailDialogOpenChange,
+  } = useSubscriptionDetailDialog(subscriptions);
   const handleEditFromDetail = useCallback((subscription: Subscription) => {
     handleEditSubscription(subscription.id);
   }, [handleEditSubscription]);
@@ -431,7 +426,7 @@ const Statistics = () => {
               {renderDonutChart(stats.budgetChartData, "currency", t("statistics.costBudget"))}
               <div className="mt-4 flex flex-col justify-center gap-4 min-[380px]:flex-row min-[380px]:gap-8">
                 <div className="text-center">
-                  <p className="text-2xl font-bold text-foreground">{formatCurrency(Math.min(stats.totalMonthly, monthlyBudget), defaultCurrency)}</p>
+                  <p className="text-2xl font-bold text-foreground">{formatCurrency(Math.min(stats.totalMonthly, monthlyBudgetAmount), defaultCurrency)}</p>
                   <p className="text-xs text-muted-foreground">{t("statistics.budgetUsed")}</p>
                 </div>
                 <div className="text-center">
@@ -458,6 +453,19 @@ const Statistics = () => {
         onEditSubscription={handleEditFromDetail}
         onRenewSubscription={handleRenewSubscription}
         today={today}
+        currencyConvert={convert}
+        currencyRatesReady={currencyRatesReady}
+        priceReferenceCurrency={priceReferenceCurrency}
+      />
+      <RenewSubscriptionDialog
+        subscription={renewingSubscription}
+        open={renewDialogOpen}
+        today={today}
+        submitting={renewSubmitting}
+        error={renewError instanceof Error ? renewError.message : null}
+        restoreFocusRef={renewRestoreFocusRef}
+        onOpenChange={handleRenewDialogOpenChange}
+        onSubmit={handleSubmitRenewSubscription}
       />
     </div>
   );

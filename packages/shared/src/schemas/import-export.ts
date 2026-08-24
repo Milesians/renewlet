@@ -1,8 +1,9 @@
 import { z } from "zod";
-import { settingsUpdateBodySchema } from "./settings";
+import { persistedSettingsBackupSchema } from "./settings";
 import { customConfigSchema } from "./custom-config";
 import { apiSubscriptionSchema, subscriptionCreateBodySchema } from "./subscriptions";
 import { apiSuccessResponseSchema } from "./api";
+import { exchangeRateSnapshotV1Schema } from "./exchange-rates";
 
 /**
  * 单次导入执行的订阅上限。
@@ -10,6 +11,8 @@ import { apiSuccessResponseSchema } from "./api";
  * 预览允许大文件做冲突分析，但真正写库限制为较小批量，避免 Cloudflare D1/PocketBase 在一次请求里承担无界写入。
  */
 export const IMPORT_APPLY_SUBSCRIPTION_LIMIT = 200;
+export const IMPORT_PREVIEW_SUBSCRIPTION_LIMIT = 1000;
+export const IMPORT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024;
 
 export const importConflictModeSchema = z.enum(["replace", "skip"]);
 export type ImportConflictMode = z.infer<typeof importConflictModeSchema>;
@@ -39,13 +42,14 @@ export type ImportSubscription = z.infer<typeof importSubscriptionSchema>;
 export const importPayloadSchema = z.object({
   source: importSourceSchema,
   // 导入 payload 是前端、Go route 与 Worker apply 共享契约；上限保护预览解析和冲突查询，不代表一次写库上限。
-  subscriptions: z.array(importSubscriptionSchema).max(5000),
-  settings: settingsUpdateBodySchema.optional(),
+  subscriptions: z.array(importSubscriptionSchema).max(IMPORT_PREVIEW_SUBSCRIPTION_LIMIT, "IMPORT_TOO_LARGE"),
+  settings: persistedSettingsBackupSchema.optional(),
   customConfig: customConfigSchema.optional(),
+  exchangeRateSnapshots: z.array(exchangeRateSnapshotV1Schema).max(240).optional(),
 }).strict();
 export type ImportPayload = z.infer<typeof importPayloadSchema>;
 
-export const importSkipIndexesSchema = z.array(z.number().int().nonnegative()).max(5000);
+export const importSkipIndexesSchema = z.array(z.number().int().nonnegative()).max(IMPORT_PREVIEW_SUBSCRIPTION_LIMIT, "IMPORT_TOO_LARGE");
 export const importApplySkipIndexesSchema = z.array(z.number().int().nonnegative()).max(IMPORT_APPLY_SUBSCRIPTION_LIMIT);
 
 export const importPreviewRequestSchema = z.object({
@@ -59,7 +63,7 @@ export type ImportPreviewRequest = z.infer<typeof importPreviewRequestSchema>;
 export const importApplyRequestSchema = z.object({
   payload: importPayloadSchema.extend({
     // 执行阶段比预览更严格，因为 replace/create 会触发真实写库、资产引用和用户隔离校验。
-    subscriptions: z.array(importSubscriptionSchema).max(IMPORT_APPLY_SUBSCRIPTION_LIMIT),
+    subscriptions: z.array(importSubscriptionSchema).max(IMPORT_APPLY_SUBSCRIPTION_LIMIT, "IMPORT_TOO_LARGE"),
   }),
   conflictMode: importConflictModeSchema,
   skipIndexes: importApplySkipIndexesSchema.default([]),
@@ -96,6 +100,8 @@ export const importPreviewPayloadSchema = z.object({
   items: z.array(importPreviewItemSchema),
   includesSettings: z.boolean(),
   includesCustomConfig: z.boolean(),
+  includesExchangeRateSnapshots: z.boolean(),
+  exchangeRateSnapshotsCount: z.number().int().nonnegative(),
 }).strict();
 export const importPreviewResponseSchema = apiSuccessResponseSchema(importPreviewPayloadSchema);
 export type ImportPreviewResponse = z.infer<typeof importPreviewPayloadSchema>;
@@ -103,6 +109,11 @@ export type ImportPreviewResponse = z.infer<typeof importPreviewPayloadSchema>;
 export const importApplyPayloadSchema = importPreviewPayloadSchema;
 export const importApplyResponseSchema = apiSuccessResponseSchema(importApplyPayloadSchema);
 export type ImportApplyResponse = z.infer<typeof importApplyPayloadSchema>;
+
+const exportPrivateAssetPathSchema = z
+  .string()
+  .trim()
+  .refine((value) => /^\/api\/app\/assets\/[A-Za-z0-9_-]+$/.test(value), "Invalid private asset path");
 
 const exportAssetSchema = z.object({
   id: z.string(),
@@ -131,9 +142,37 @@ export const renewletExportV1Schema = z.object({
   data: z.object({
     // Export v1 保存 API 订阅形状而不是 UI 草稿形状，保证 Docker 与 Cloudflare 导出的数据可以互导。
     subscriptions: z.array(renewletExportSubscriptionSchema),
-    settings: settingsUpdateBodySchema.optional(),
+    settings: persistedSettingsBackupSchema.optional(),
     customConfig: customConfigSchema.optional(),
+    // 历史汇率快照是 data.json 的恢复事实源；manifest 只做审计，不能承载报表口径。
+    exchangeRateSnapshots: z.array(exchangeRateSnapshotV1Schema).max(240).optional(),
     assets: z.array(exportAssetSchema).optional(),
   }).strict(),
 }).strict();
 export type RenewletExportV1 = z.infer<typeof renewletExportV1Schema>;
+
+export const renewletExportMissingAssetReferenceSchema = z.enum(["subscription.logo", "customConfig.paymentMethods.icon"]);
+export type RenewletExportMissingAssetReference = z.infer<typeof renewletExportMissingAssetReferenceSchema>;
+
+export const renewletExportMissingAssetReasonSchema = z.enum(["not_found", "file_missing", "too_large", "read_failed"]);
+export type RenewletExportMissingAssetReason = z.infer<typeof renewletExportMissingAssetReasonSchema>;
+
+export const renewletExportMissingAssetSchema = z.object({
+  assetId: z.string().trim().min(1),
+  path: exportPrivateAssetPathSchema,
+  reference: renewletExportMissingAssetReferenceSchema,
+  referenceId: z.string().trim().min(1),
+  reason: renewletExportMissingAssetReasonSchema,
+}).strict();
+export type RenewletExportMissingAsset = z.infer<typeof renewletExportMissingAssetSchema>;
+
+export const renewletExportManifestV1Schema = z.object({
+  kind: z.literal("renewlet-export"),
+  schemaVersion: z.literal(1),
+  exportedAt: z.string(),
+  subscriptions: z.number().int().nonnegative(),
+  assets: z.number().int().nonnegative(),
+  // manifest 只做 ZIP 审计；导入恢复仍以 data.json 为事实源，缺失资产不能反向驱动写库。
+  missingAssets: z.array(renewletExportMissingAssetSchema),
+}).strict();
+export type RenewletExportManifestV1 = z.infer<typeof renewletExportManifestV1Schema>;

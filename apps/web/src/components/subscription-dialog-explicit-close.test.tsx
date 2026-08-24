@@ -57,7 +57,7 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     id: "sub-1",
     name: "Critical SaaS",
     logo: undefined,
-    price: 50,
+    price: "50",
     currency: "CNY",
     billingCycle: "monthly",
     customDays: undefined,
@@ -125,8 +125,8 @@ describe("SubscriptionDialog explicit close", () => {
               enabled: true,
               splitMode: "custom",
               members: [
-                { id: "partner", name: "伴侣", currency: "CNY", customAmount: 10 },
-                { id: "friend", name: "朋友", currency: "CNY", customAmount: 10 },
+                { id: "partner", name: "伴侣", currency: "CNY", customAmount: "10" },
+                { id: "friend", name: "朋友", currency: "CNY", customAmount: "10" },
               ],
             },
           })}
@@ -146,7 +146,7 @@ describe("SubscriptionDialog explicit close", () => {
     expect(screen.getByRole("dialog", { name: "管理共享成员" })).toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
 
-    await user.click(screen.getByRole("button", { name: "返回表单" }));
+    await user.click(screen.getByRole("button", { name: "完成" }));
     expect(screen.queryByRole("dialog", { name: "管理共享成员" })).not.toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "编辑订阅" })).toBeInTheDocument();
   });

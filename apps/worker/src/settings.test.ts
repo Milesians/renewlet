@@ -3,7 +3,7 @@ import { createDefaultAppSettings } from "@renewlet/shared/settings-defaults";
 import type { ApiAppSettings } from "@renewlet/shared/schemas/settings";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readSuccessData } from "./api-test-helpers";
-import { ensureSettings } from "./db";
+import { ensureSettings, normalizeSettingsJson } from "./db";
 import { readSettings, updateSettings } from "./settings";
 import type { Env } from "./types";
 
@@ -47,6 +47,14 @@ class SettingsTestDB {
   prepare(sql: string) {
     return new SettingsTestStatement(this.state, sql);
   }
+
+  async batch(statements: D1PreparedStatement[]): Promise<D1Result[]> {
+    const results: D1Result[] = [];
+    for (const statement of statements) {
+      results.push(await (statement as unknown as SettingsTestStatement).run());
+    }
+    return results;
+  }
 }
 
 class SettingsTestStatement {
@@ -77,6 +85,13 @@ class SettingsTestStatement {
     return null;
   }
 
+  async all<T>(): Promise<D1Result<T>> {
+    if (this.sql.includes("FROM subscriptions")) {
+      return d1Result<T>([]);
+    }
+    throw new Error(`unexpected settings query: ${this.sql}`);
+  }
+
   async run(): Promise<D1Result> {
     if (this.sql.includes("INSERT INTO settings")) {
       const [userId, settingsJson] = this.values as [string, string, string, string];
@@ -98,12 +113,14 @@ class SettingsTestStatement {
 }
 
 function settingsRequest(method: string, locale: string, body?: unknown): Request {
+  const unsafe = !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
   const init: RequestInit = {
     method,
     headers: {
-      authorization: "Bearer session-token",
+      cookie: "renewlet_session=session-token; renewlet_csrf=csrf-token",
       "content-type": "application/json",
       "x-renewlet-locale": locale,
+      ...(unsafe ? { origin: "https://renewlet.example", "x-renewlet-csrf": "csrf-token" } : {}),
     },
   };
   if (body !== undefined) {
@@ -115,7 +132,6 @@ function settingsRequest(method: string, locale: string, body?: unknown): Reques
 describe("Cloudflare settings initialization", () => {
   beforeEach(() => {
     authMocks.requireAuth.mockReset().mockResolvedValue({
-      token: "session-token",
       user: { id: USER_ID },
       session: { id: "ses" },
     });
@@ -145,7 +161,7 @@ describe("Cloudflare settings initialization", () => {
     expect(createDefaultAppSettings().telegramMessageFormat).toBe("plain");
     const existing = {
       ...createDefaultAppSettings({ locale: "en-US" }),
-      monthlyBudget: 2333,
+      monthlyBudget: "2333",
       telegramMessageFormat: "markdown",
     };
     const state: SettingsTestState = {
@@ -161,13 +177,49 @@ describe("Cloudflare settings initialization", () => {
     const settings = await ensureSettings(env, USER_ID, "zh-CN");
 
     expect(settings.telegramMessageFormat).toBe("plain");
-    expect(settings.monthlyBudget).toBe(2333);
+    expect(settings.monthlyBudget).toBe("2333");
+  });
+
+  it("adds subscription price reference defaults when reading old settings JSON", () => {
+    const settings = normalizeSettingsJson(JSON.stringify({
+      defaultCurrency: "USD",
+      monthlyBudget: "2333",
+    }));
+
+    expect(settings.defaultCurrency).toBe("USD");
+    expect(settings.monthlyBudget).toBe("2333");
+    expect(settings.subscriptionPriceReferenceEnabled).toBe(false);
+    expect(settings.subscriptionPriceReferenceCurrency).toBe("default");
+  });
+
+  it("recovers invalid stored subscription price reference currency without dropping other settings", async () => {
+    const existing = {
+      ...createDefaultAppSettings({ locale: "en-US" }),
+      monthlyBudget: "2333",
+      subscriptionPriceReferenceEnabled: true,
+      subscriptionPriceReferenceCurrency: "usd",
+    };
+    const state: SettingsTestState = {
+      rows: new Map([[USER_ID, JSON.stringify(existing)]]),
+      inserts: [],
+    };
+    const env = {
+      DB: new SettingsTestDB(state) as unknown as D1Database,
+      ASSETS: {} as Fetcher,
+      ASSETS_BUCKET: {} as R2Bucket,
+    } as Env;
+
+    const settings = await ensureSettings(env, USER_ID, "zh-CN");
+
+    expect(settings.subscriptionPriceReferenceEnabled).toBe(true);
+    expect(settings.subscriptionPriceReferenceCurrency).toBe("default");
+    expect(settings.monthlyBudget).toBe("2333");
   });
 
   it("recovers invalid stored DingTalk template fields without dropping other settings", async () => {
     const existing = {
       ...createDefaultAppSettings({ locale: "en-US" }),
-      monthlyBudget: 2333,
+      monthlyBudget: "2333",
       dingtalkTitleTemplate: "x".repeat(501),
       dingtalkContentTemplate: 42,
     };
@@ -185,7 +237,7 @@ describe("Cloudflare settings initialization", () => {
 
     expect(settings.dingtalkTitleTemplate).toBe("");
     expect(settings.dingtalkContentTemplate).toBe("");
-    expect(settings.monthlyBudget).toBe(2333);
+    expect(settings.monthlyBudget).toBe("2333");
   });
 
   it("readSettings ensures a settings row from the request locale", async () => {
@@ -194,18 +246,67 @@ describe("Cloudflare settings initialization", () => {
     const response = await readSettings(settingsRequest("GET", "zh-CN"), env);
 
     expect(response.status).toBe(200);
-    await expect(readSuccessData(response)).resolves.toMatchObject({ settings: { locale: "zh-CN" } });
+    await expect(readSuccessData(response)).resolves.toMatchObject({
+      settings: { locale: "zh-CN" },
+      secretStatus: { telegramBotToken: { configured: false }, "aiRecognition.apiKey": { configured: false } },
+    });
     expect(JSON.parse(state.rows.get(USER_ID) ?? "{}")).toMatchObject({ locale: "zh-CN" });
+  });
+
+  it("never returns stored secrets and only updates them through discriminated mutations", async () => {
+    const defaults = createDefaultAppSettings({ locale: "en-US" });
+    const existing = {
+      ...defaults,
+      telegramBotToken: "stored-telegram-secret",
+      aiRecognition: { ...defaults.aiRecognition, apiKey: "stored-ai-secret" },
+    };
+    const { env, state } = createEnv(existing);
+
+    const read = await readSettings(settingsRequest("GET", "en-US"), env);
+    const readText = await read.text();
+    expect(readText).not.toContain("stored-telegram-secret");
+    expect(readText).not.toContain("stored-ai-secret");
+    expect(JSON.parse(readText).data.secretStatus).toMatchObject({
+      telegramBotToken: { configured: true },
+      "aiRecognition.apiKey": { configured: true },
+    });
+
+    const update = await updateSettings(settingsRequest("PUT", "en-US", {
+      secretUpdates: {
+        telegramBotToken: { action: "clear" },
+        "aiRecognition.apiKey": { action: "set", value: "new-ai-secret" },
+      },
+    }), env);
+    const updateText = await update.text();
+    expect(updateText).not.toContain("new-ai-secret");
+    expect(JSON.parse(updateText).data.secretStatus).toMatchObject({
+      telegramBotToken: { configured: false },
+      "aiRecognition.apiKey": { configured: true },
+    });
+    expect(JSON.parse(state.rows.get(USER_ID) ?? "{}")).toMatchObject({
+      telegramBotToken: "",
+      aiRecognition: { apiKey: "new-ai-secret" },
+    });
+  });
+
+  it("rejects direct secret fields and malformed secret mutations", async () => {
+    const { env } = createEnv(createDefaultAppSettings({ locale: "en-US" }));
+
+    await expect(updateSettings(settingsRequest("PUT", "en-US", { telegramBotToken: "raw-secret" }), env))
+      .rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
+    await expect(updateSettings(settingsRequest("PUT", "en-US", {
+      secretUpdates: { telegramBotToken: { action: "set" } },
+    }), env)).rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
   });
 
   it("updateSettings uses the request locale when creating the first row", async () => {
     const { env, state } = createEnv();
 
-    const response = await updateSettings(settingsRequest("PUT", "zh-CN", { monthlyBudget: 2333 }), env);
+    const response = await updateSettings(settingsRequest("PUT", "zh-CN", { monthlyBudget: "2333" }), env);
 
     expect(response.status).toBe(200);
-    await expect(readSuccessData(response)).resolves.toMatchObject({ settings: { locale: "zh-CN", monthlyBudget: 2333 } });
-    expect(JSON.parse(state.rows.get(USER_ID) ?? "{}")).toMatchObject({ locale: "zh-CN", monthlyBudget: 2333 });
+    await expect(readSuccessData(response)).resolves.toMatchObject({ settings: { locale: "zh-CN", monthlyBudget: "2333" } });
+    expect(JSON.parse(state.rows.get(USER_ID) ?? "{}")).toMatchObject({ locale: "zh-CN", monthlyBudget: "2333" });
   });
 
   it("does not create settings when the PATCH payload is invalid", async () => {
@@ -215,6 +316,15 @@ describe("Cloudflare settings initialization", () => {
       .rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
 
     expect(state.rows.has(USER_ID)).toBe(false);
+  });
+
+  it("rejects invalid subscription price reference currency on write", async () => {
+    const { env } = createEnv(createDefaultAppSettings({ locale: "en-US" }));
+
+    await expect(updateSettings(settingsRequest("PUT", "zh-CN", {
+      subscriptionPriceReferenceEnabled: true,
+      subscriptionPriceReferenceCurrency: "usd",
+    }), env)).rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
   });
 
   it("accepts only supported Telegram message formats on write", async () => {
@@ -227,6 +337,61 @@ describe("Cloudflare settings initialization", () => {
     await expect(updateSettings(settingsRequest("PUT", "en-US", { telegramMessageFormat: "markdown" }), env))
       .rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
     expect(JSON.parse(state.rows.get(USER_ID) ?? "{}")).toMatchObject({ telegramMessageFormat: "html" });
+  });
+
+  it("merges online icon source settings without dropping defaults", async () => {
+    const { env, state } = createEnv(createDefaultAppSettings({ locale: "en-US" }));
+
+    const response = await updateSettings(settingsRequest("PUT", "en-US", {
+      onlineIconSources: {
+        appStore: { enabled: false },
+      },
+    }), env);
+
+    expect(response.status).toBe(200);
+    await expect(readSuccessData(response)).resolves.toMatchObject({
+      settings: {
+        onlineIconSources: {
+          appStore: { enabled: false, storefronts: ["us"] },
+        },
+      },
+    });
+    expect(JSON.parse(state.rows.get(USER_ID) ?? "{}")).toMatchObject({
+      onlineIconSources: {
+        appStore: { enabled: false, storefronts: ["us"] },
+      },
+    });
+    await expect(updateSettings(settingsRequest("PUT", "en-US", {
+      onlineIconSources: {
+        appStore: { storefronts: ["cn"] },
+      },
+    }), env)).resolves.toMatchObject({ status: 200 });
+    expect(JSON.parse(state.rows.get(USER_ID) ?? "{}")).toMatchObject({
+      onlineIconSources: {
+        appStore: { enabled: false, storefronts: ["cn"] },
+      },
+    });
+
+    await expect(updateSettings(settingsRequest("PUT", "en-US", {
+      onlineIconSources: {
+        googlePlay: { enabled: true },
+      },
+    }), env)).rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
+    await expect(updateSettings(settingsRequest("PUT", "en-US", {
+      onlineIconSources: {
+        appStore: { storefronts: [] },
+      },
+    }), env)).rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
+    await expect(updateSettings(settingsRequest("PUT", "en-US", {
+      onlineIconSources: {
+        appStore: { storefronts: ["us", "us"] },
+      },
+    }), env)).rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
+    await expect(updateSettings(settingsRequest("PUT", "en-US", {
+      onlineIconSources: {
+        appStore: { storefronts: ["jp"] },
+      },
+    }), env)).rejects.toMatchObject({ status: 400, code: "INVALID_PAYLOAD" });
   });
 
   it("rejects overly long DingTalk templates on write", async () => {

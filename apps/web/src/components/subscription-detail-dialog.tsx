@@ -20,13 +20,16 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { MobileBottomDrawerContent, MobileDrawerRoot } from "@/components/ui/mobile-drawer";
 import { useCustomConfig } from "@/contexts/CustomConfigContext";
-import { useExchangeRates } from "@/hooks/use-exchange-rates";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { useSettings } from "@/hooks/use-settings";
 import { useI18n } from "@/i18n/I18nProvider";
 import { cn } from "@/lib/utils";
 import type { DateOnly } from "@/lib/time/date-only";
 import { formatBillingCycleLabel, isOneTimeBuyout, isOneTimeFixedTerm } from "@/lib/subscription-billing";
+import {
+  getSubscriptionPriceReference,
+  type SubscriptionCurrencyConverter,
+} from "@/modules/subscriptions/domain/subscription-price-reference";
 import { getEffectiveSubscriptionStatus } from "@/modules/subscriptions/domain/subscription-status";
 import { isManualRenewEligible } from "@renewlet/shared/subscription-renewal";
 import { calculateCostSharingSummary } from "@renewlet/shared/cost-sharing";
@@ -40,6 +43,9 @@ interface SubscriptionDetailDialogProps {
   onEditSubscription?: (subscription: Subscription) => void;
   onRenewSubscription?: (id: string) => void;
   today: DateOnly | string;
+  currencyConvert: SubscriptionCurrencyConverter;
+  currencyRatesReady: boolean;
+  priceReferenceCurrency: string | null;
 }
 
 interface SubscriptionDetailContentProps {
@@ -49,6 +55,9 @@ interface SubscriptionDetailContentProps {
   onEditSubscription?: (subscription: Subscription) => void;
   onRenewSubscription?: (id: string) => void;
   onAddToCalendar: () => void;
+  currencyConvert: SubscriptionCurrencyConverter;
+  currencyRatesReady: boolean;
+  priceReferenceCurrency: string | null;
 }
 
 function DetailRow({
@@ -75,11 +84,13 @@ function SubscriptionDetailContent({
   onEditSubscription,
   onRenewSubscription,
   onAddToCalendar,
+  currencyConvert,
+  currencyRatesReady,
+  priceReferenceCurrency,
 }: SubscriptionDetailContentProps) {
   const { config } = useCustomConfig();
   const { data: settings } = useSettings();
   const { t, locale, label, formatDateOnly, formatCurrency } = useI18n();
-  const { convert } = useExchangeRates(settings?.exchangeRateProvider);
   const category = config.categories.find((item) => item.value === subscription.category);
   const paymentMethod = subscription.paymentMethod
     ? config.paymentMethods.find((item) => item.value === subscription.paymentMethod)
@@ -93,8 +104,20 @@ function SubscriptionDetailContent({
   const canManualRenew = Boolean(onRenewSubscription) && isManualRenewEligible(subscription);
   const costSharingSummary = calculateCostSharingSummary(subscription.costSharing, subscription.price, {
     baseCurrency: subscription.currency,
-    convert,
+    convert: currencyConvert,
   });
+  const priceReference = getSubscriptionPriceReference({
+    price: subscription.price,
+    currency: subscription.currency,
+    targetCurrency: priceReferenceCurrency,
+    currencyRatesReady,
+    currencyConvert,
+  });
+  const priceReferenceLabel = priceReference === null
+    ? null
+    : t("subscription.priceReference", {
+        amount: formatCurrency(priceReference.amount, priceReference.currency),
+      });
   const renewalLabel = isOneTime
     ? t("subscription.renewal.oneTime")
     : subscription.autoRenew
@@ -144,6 +167,11 @@ function SubscriptionDetailContent({
           <p className="text-sm text-muted-foreground">
             {formatBillingCycleLabel(subscription, locale)}
           </p>
+          {priceReferenceLabel ? (
+            <p className="truncate text-xs tabular-nums text-muted-foreground">
+              {priceReferenceLabel}
+            </p>
+          ) : null}
         </div>
         <SubscriptionStatusBadge status={effectiveStatus} />
       </div>
@@ -166,11 +194,11 @@ function SubscriptionDetailContent({
           </div>
         ) : null}
         <DetailRow label={t("subscription.detail.category")}>
-          <span className="break-words">{category ? label(category.labels) : subscription.category}</span>
+          <span className="wrap-break-word">{category ? label(category.labels) : subscription.category}</span>
         </DetailRow>
         {subscription.paymentMethod ? (
           <DetailRow label={t("subscription.field.paymentMethod")}>
-            <span className="break-words">{paymentMethod ? label(paymentMethod.labels) : subscription.paymentMethod}</span>
+            <span className="wrap-break-word">{paymentMethod ? label(paymentMethod.labels) : subscription.paymentMethod}</span>
           </DetailRow>
         ) : null}
         {isBuyout ? (
@@ -234,7 +262,7 @@ function SubscriptionDetailContent({
         {subscription.notes ? (
           <div className="grid gap-2 border-t border-border pt-3">
             <p className="text-sm text-muted-foreground">{t("subscription.field.notes")}</p>
-            <div className="max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-secondary/40 p-3 text-sm leading-6 text-foreground">
+            <div className="max-h-48 overflow-y-auto whitespace-pre-wrap wrap-break-word rounded-lg border border-border bg-secondary/40 p-3 text-sm leading-6 text-foreground">
               {subscription.notes}
             </div>
           </div>
@@ -275,6 +303,9 @@ export function SubscriptionDetailDialog({
   onEditSubscription,
   onRenewSubscription,
   today,
+  currencyConvert,
+  currencyRatesReady,
+  priceReferenceCurrency,
 }: SubscriptionDetailDialogProps) {
   const isMobile = useMediaQuery("(max-width: 639px)");
   const { t } = useI18n();
@@ -316,6 +347,9 @@ export function SubscriptionDetailDialog({
                   today={today}
                   onClose={closeDetail}
                   onAddToCalendar={openAddToCalendar}
+                  currencyConvert={currencyConvert}
+                  currencyRatesReady={currencyRatesReady}
+                  priceReferenceCurrency={priceReferenceCurrency}
                   {...(onEditSubscription ? { onEditSubscription } : {})}
                   {...(onRenewSubscription ? { onRenewSubscription } : {})}
                 />
@@ -339,6 +373,9 @@ export function SubscriptionDetailDialog({
                   today={today}
                   onClose={closeDetail}
                   onAddToCalendar={openAddToCalendar}
+                  currencyConvert={currencyConvert}
+                  currencyRatesReady={currencyRatesReady}
+                  priceReferenceCurrency={priceReferenceCurrency}
                   {...(onEditSubscription ? { onEditSubscription } : {})}
                   {...(onRenewSubscription ? { onRenewSubscription } : {})}
                 />

@@ -12,7 +12,7 @@
  * - 首页统计由 `useDashboardStats` 生成，CRUD 弹窗状态由 `useSubscriptionCrud` 管理。
  */
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
 import Link from '@/components/router-link';
 import type { Subscription } from "@/types/subscription";
 import { Header } from "@/components/header";
@@ -26,16 +26,17 @@ import { DashboardPageSkeleton } from "@/components/loading-skeleton";
 import { EditSubscriptionDialog } from "@/components/edit-subscription-dialog";
 import { CreditCard, TrendingUp, Clock, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useExchangeRates } from "@/hooks/use-exchange-rates";
+import { useReportExchangeRates } from "@/hooks/use-report-exchange-rates";
 import { useSubscriptions } from "@/hooks/use-subscriptions";
 import { useSettings } from "@/hooks/use-settings";
 import { useCustomConfig } from "@/contexts/CustomConfigContext";
 import { useDashboardStats } from "@/modules/subscriptions/application/use-dashboard-stats";
 import { useSubscriptionCrud } from "@/modules/subscriptions/application/use-subscription-crud";
 import { collectSubscriptionTags } from "@/modules/subscriptions/domain/subscription-filters";
+import { resolveSubscriptionPriceReferenceCurrency } from "@/modules/subscriptions/domain/subscription-price-reference";
 import { useI18n } from "@/i18n/I18nProvider";
 import { DEFAULT_NOTIFICATION_REMINDER_DAYS } from "@/types/subscription";
-import { useDeferredDialogCleanup } from "@/hooks/use-deferred-dialog-cleanup";
+import { useSubscriptionDetailDialog } from "@/hooks/use-subscription-detail-dialog";
 import { todayDateOnlyInTimeZone } from "@/lib/time/date-only";
 import { cn } from "@/lib/utils";
 
@@ -50,25 +51,22 @@ export default function Index() {
   const { config } = useCustomConfig();
   const { t, formatCurrency } = useI18n();
   const exchangeRateProvider = settings?.exchangeRateProvider;
-  const { convert, loading: ratesLoading } = useExchangeRates(exchangeRateProvider);
+  const { convert, loading: ratesLoading, sourceDate: ratesSourceDate } = useReportExchangeRates(exchangeRateProvider);
+  const currencyRatesReady = Boolean(ratesSourceDate) && !ratesLoading;
   const defaultCurrency = settings?.defaultCurrency ?? "CNY";
+  const priceReferenceCurrency = settings ? resolveSubscriptionPriceReferenceCurrency(settings) : null;
   const timeZone = settings?.timezone ?? "UTC";
   const inheritedReminderDays = settings?.notificationReminderDays ?? DEFAULT_NOTIFICATION_REMINDER_DAYS;
   const categoryByValue = useMemo(() => new Map(config.categories.map((category) => [category.value, category])), [config.categories]);
   const paymentMethodByValue = useMemo(() => new Map(config.paymentMethods.map((method) => [method.value, method])), [config.paymentMethods]);
   const availableTags = useMemo(() => collectSubscriptionTags(subscriptions), [subscriptions]);
   const today = useMemo(() => todayDateOnlyInTimeZone(new Date(), timeZone), [timeZone]);
-  const [detailSubscriptionId, setDetailSubscriptionId] = useState<string | null>(null);
-  const [detailDialogOpen, setDetailDialogOpen] = useState(false);
-  const selectedDetailSubscription = useMemo(
-    () => subscriptions.find((item) => item.id === detailSubscriptionId) ?? null,
-    [detailSubscriptionId, subscriptions],
-  );
-  const { scheduleCleanup: scheduleDetailCleanup, cancelCleanup: cancelDetailCleanup } =
-    useDeferredDialogCleanup(() => {
-      // 详情弹窗关闭动画期间仍要保留内容快照，避免 Dialog/Drawer fade-out 时标题和备注闪空。
-      setDetailSubscriptionId(null);
-    });
+  const {
+    detailDialogOpen,
+    selectedDetailSubscription,
+    handleViewDetails,
+    handleDetailDialogOpenChange,
+  } = useSubscriptionDetailDialog(subscriptions);
   const { activeSubscriptions, totalMonthly, upcomingCount, trialCount } = useDashboardStats(
     subscriptions,
     defaultCurrency,
@@ -86,19 +84,6 @@ export default function Index() {
     handleSaveSubscription,
     handleEditDialogOpenChange,
   } = useSubscriptionCrud(subscriptions);
-  const handleViewDetails = useCallback((id: string) => {
-    cancelDetailCleanup();
-    setDetailSubscriptionId(id);
-    setDetailDialogOpen(true);
-  }, [cancelDetailCleanup]);
-  const handleDetailDialogOpenChange = useCallback((nextOpen: boolean) => {
-    setDetailDialogOpen(nextOpen);
-    if (nextOpen) {
-      cancelDetailCleanup();
-      return;
-    }
-    scheduleDetailCleanup();
-  }, [cancelDetailCleanup, scheduleDetailCleanup]);
   const handleEditFromDetail = useCallback((subscription: Subscription) => {
     handleEditSubscription(subscription.id);
   }, [handleEditSubscription]);
@@ -186,7 +171,9 @@ export default function Index() {
                     subscription={sub}
                     timeZone={timeZone}
                     inheritedReminderDays={inheritedReminderDays}
-                    costSharingCurrencyConvert={convert}
+                    currencyConvert={convert}
+                    currencyRatesReady={currencyRatesReady}
+                    priceReferenceCurrency={priceReferenceCurrency}
                     categoryByValue={categoryByValue}
                     paymentMethodByValue={paymentMethodByValue}
                     onEdit={handleEditSubscription}
@@ -218,7 +205,7 @@ export default function Index() {
                 categories={config.categories}
                 defaultCurrency={defaultCurrency}
                 timeZone={timeZone}
-                exchangeRateProvider={exchangeRateProvider}
+                convert={convert}
               />
             </div>
 
@@ -248,6 +235,9 @@ export default function Index() {
         subscription={selectedDetailSubscription}
         onEditSubscription={handleEditFromDetail}
         today={today}
+        currencyConvert={convert}
+        currencyRatesReady={currencyRatesReady}
+        priceReferenceCurrency={priceReferenceCurrency}
       />
     </div>
   );

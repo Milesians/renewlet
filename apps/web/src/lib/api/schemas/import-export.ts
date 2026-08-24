@@ -4,6 +4,8 @@ export {
   importApplyPayloadSchema,
   importApplyResponseSchema,
   IMPORT_APPLY_SUBSCRIPTION_LIMIT,
+  IMPORT_PREVIEW_MAX_BYTES,
+  IMPORT_PREVIEW_SUBSCRIPTION_LIMIT,
   importConflictModeSchema,
   importConfidenceSchema,
   importItemActionSchema,
@@ -19,6 +21,10 @@ export {
   importSubscriptionSchema,
   importSummarySchema,
   renewletExportV1Schema,
+  renewletExportManifestV1Schema,
+  renewletExportMissingAssetReasonSchema,
+  renewletExportMissingAssetReferenceSchema,
+  renewletExportMissingAssetSchema,
 } from "@renewlet/shared/schemas/import-export";
 
 export type {
@@ -34,6 +40,10 @@ export type {
   ImportSource,
   ImportSubscription,
   ImportSummary,
+  RenewletExportManifestV1,
   RenewletExportAsset,
+  RenewletExportMissingAsset,
+  RenewletExportMissingAssetReason,
+  RenewletExportMissingAssetReference,
   RenewletExportV1,
 } from "@renewlet/shared/schemas/import-export";

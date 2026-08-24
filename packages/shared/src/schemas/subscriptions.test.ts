@@ -3,13 +3,14 @@ import {
   SUBSCRIPTION_PAYMENT_METHOD_NONE,
   apiSubscriptionSchema,
   subscriptionCreateBodySchema,
+  subscriptionRenewBodySchema,
   subscriptionsListQuerySchema,
 } from "./subscriptions";
 
 const recurringBody = {
   name: "QQ Music",
   logo: null,
-  price: 15,
+  price: "15",
   currency: "CNY",
   billingCycle: "monthly",
   customDays: null,
@@ -92,6 +93,233 @@ describe("subscription start date contract", () => {
       startDate: "2026-06-01",
       autoCalculateNextBillingDate: false,
     }).success).toBe(true);
+  });
+});
+
+describe("cost sharing collection reminder contract", () => {
+  const costSharing = {
+    enabled: true,
+    splitMode: "equal",
+    members: [{ id: "partner", name: "Partner", currency: "USD" }],
+  } as const;
+
+  it("keeps old cost sharing payloads compatible", () => {
+    const parsed = subscriptionCreateBodySchema.parse({
+      ...recurringBody,
+      costSharing,
+    });
+
+    expect(parsed.costSharing).toEqual(costSharing);
+  });
+
+  it("accepts collection reminders with inherited or custom days", () => {
+    expect(subscriptionCreateBodySchema.parse({
+      ...recurringBody,
+      startDate: "2026-01-01",
+      costSharing: {
+        ...costSharing,
+        collectionReminder: { enabled: true, reminderDays: -1 },
+      },
+    }).costSharing?.collectionReminder).toEqual({ enabled: true, reminderDays: -1 });
+
+    expect(subscriptionCreateBodySchema.parse({
+      ...recurringBody,
+      startDate: "2026-01-01",
+      costSharing: {
+        ...costSharing,
+        collectionReminder: { enabled: true, reminderDays: 0 },
+      },
+    }).costSharing?.collectionReminder).toEqual({ enabled: true, reminderDays: 0 });
+  });
+
+  it("rejects the removed collection interval field", () => {
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      startDate: "2026-01-01",
+      costSharing: {
+        ...costSharing,
+        collectionReminder: { enabled: true, intervalMonths: 3, reminderDays: -1 },
+      },
+    }).success).toBe(false);
+  });
+
+  it("rejects disabled reminder sentinel for collection reminders", () => {
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      startDate: "2026-01-01",
+      costSharing: {
+        ...costSharing,
+        collectionReminder: { enabled: true, reminderDays: -2 },
+      },
+    }).success).toBe(false);
+  });
+
+  it("rejects invalid member joined dates", () => {
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      costSharing: {
+        ...costSharing,
+        members: [{ id: "partner", name: "Partner", joinedDate: "2026/01/01" }],
+      },
+    }).success).toBe(false);
+  });
+
+  it("requires member joined dates when collection reminders are enabled without a subscription start date", () => {
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      startDate: null,
+      costSharing: {
+        ...costSharing,
+        collectionReminder: { enabled: true, reminderDays: -1 },
+      },
+    }).success).toBe(false);
+
+    expect(subscriptionCreateBodySchema.parse({
+      ...recurringBody,
+      startDate: null,
+      costSharing: {
+        ...costSharing,
+        members: [{ id: "partner", name: "Partner", joinedDate: "2026-01-01" }],
+        collectionReminder: { enabled: true, reminderDays: -1 },
+      },
+    }).costSharing?.members[0]?.joinedDate).toBe("2026-01-01");
+  });
+
+  it("rejects enabled collection reminders when cost sharing is disabled", () => {
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      startDate: "2026-01-01",
+      costSharing: {
+        ...costSharing,
+        enabled: false,
+        collectionReminder: { enabled: true, reminderDays: -1 },
+      },
+    }).success).toBe(false);
+  });
+
+  it("rejects collection reminders for one-time buyouts while accepting fixed-term one-time records", () => {
+    const collectionCostSharing = {
+      ...costSharing,
+      collectionReminder: { enabled: true, reminderDays: -1 },
+    };
+
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      billingCycle: "one-time",
+      startDate: "2026-01-01",
+      nextBillingDate: "2026-01-01",
+      autoCalculateNextBillingDate: false,
+      costSharing: collectionCostSharing,
+    }).success).toBe(false);
+
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      billingCycle: "one-time",
+      startDate: "2026-01-01",
+      nextBillingDate: "2026-04-01",
+      autoCalculateNextBillingDate: false,
+      oneTimeTermCount: 3,
+      oneTimeTermUnit: "month",
+      costSharing: collectionCostSharing,
+    }).success).toBe(true);
+  });
+
+  it("rejects member joined dates outside the subscription date range", () => {
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      startDate: "2026-01-10",
+      nextBillingDate: "2026-02-10",
+      costSharing: {
+        ...costSharing,
+        members: [{ id: "partner", name: "Partner", joinedDate: "2026-01-09" }],
+      },
+    }).success).toBe(false);
+
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      startDate: "2026-01-10",
+      nextBillingDate: "2026-02-10",
+      costSharing: {
+        ...costSharing,
+        members: [{ id: "partner", name: "Partner", joinedDate: "2026-02-11" }],
+      },
+    }).success).toBe(false);
+
+    expect(subscriptionCreateBodySchema.safeParse({
+      ...recurringBody,
+      startDate: "2026-01-10",
+      nextBillingDate: "2026-02-10",
+      costSharing: {
+        ...costSharing,
+        members: [{ id: "partner", name: "Partner", joinedDate: "2026-01-10" }],
+      },
+    }).success).toBe(true);
+  });
+});
+
+describe("subscription renew request contract", () => {
+  const renewBody = {
+    mode: "continue",
+    price: "12.500000",
+    currency: "USD",
+    startDate: null,
+    nextBillingDate: "2026-08-01",
+    autoCalculateNextBillingDate: false,
+  } as const;
+
+  it("accepts continue renewal payloads and canonicalizes money", () => {
+    const parsed = subscriptionRenewBodySchema.parse(renewBody);
+
+    expect(parsed).toMatchObject({
+      mode: "continue",
+      price: "12.5",
+      currency: "USD",
+      startDate: null,
+      nextBillingDate: "2026-08-01",
+      autoCalculateNextBillingDate: false,
+    });
+  });
+
+  it("accepts restart renewal only with a real start date", () => {
+    expect(subscriptionRenewBodySchema.parse({
+      ...renewBody,
+      mode: "restart",
+      startDate: "2026-08-12",
+      nextBillingDate: "2026-09-12",
+      autoCalculateNextBillingDate: true,
+    })).toMatchObject({
+      mode: "restart",
+      startDate: "2026-08-12",
+      nextBillingDate: "2026-09-12",
+      autoCalculateNextBillingDate: true,
+    });
+
+    expect(subscriptionRenewBodySchema.safeParse({
+      ...renewBody,
+      mode: "restart",
+      startDate: null,
+    }).success).toBe(false);
+
+    expect(subscriptionRenewBodySchema.safeParse({
+      ...renewBody,
+      mode: "restart",
+      startDate: undefined,
+    }).success).toBe(false);
+  });
+
+  it("rejects invalid renew money, currency, dates, and unknown fields", () => {
+    expect(subscriptionRenewBodySchema.safeParse({ ...renewBody, price: "1e3" }).success).toBe(false);
+    expect(subscriptionRenewBodySchema.safeParse({ ...renewBody, currency: "usd" }).success).toBe(false);
+    expect(subscriptionRenewBodySchema.safeParse({ ...renewBody, nextBillingDate: "2026-08-01T00:00:00Z" }).success).toBe(false);
+    expect(subscriptionRenewBodySchema.safeParse({
+      ...renewBody,
+      startDate: "2026-09-01",
+      nextBillingDate: "2026-08-31",
+    }).success).toBe(false);
+    expect(subscriptionRenewBodySchema.safeParse({
+      ...renewBody,
+      note: "unexpected",
+    }).success).toBe(false);
   });
 });
 

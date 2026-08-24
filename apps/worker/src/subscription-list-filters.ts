@@ -50,7 +50,8 @@ async function collectFilteredSubscriptions(env: Env, userId: string, query: Sub
       }
     }
     if (candidates.length < subscriptionListScanPageSize) break;
-    const last = candidates[candidates.length - 1]!;
+    const last = candidates.at(-1);
+    if (!last) break;
     scanCursor = { createdAt: last.created_at, id: last.subscription_id };
   }
   return { rows: await getSubscriptionsByIds(env, userId, pageIds), total };

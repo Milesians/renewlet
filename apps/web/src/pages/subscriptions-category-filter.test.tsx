@@ -4,7 +4,10 @@ import type { ReactNode } from "react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { assertDateOnly } from "@/lib/time/date-only";
+import type { CustomConfig } from "@/types/config";
 import { DEFAULT_SETTINGS, type Subscription } from "@/types/subscription";
+import { appSettingsSecretStatus } from "@renewlet/shared/schemas/settings";
+import type { SettingsReadModel } from "@/services/settings-service";
 import Subscriptions from "./subscriptions";
 
 type RecurringBillingCycle = Exclude<Subscription["billingCycle"], "custom" | "one-time">;
@@ -14,11 +17,12 @@ interface MockInfiniteSubscriptionsResult {
   subscriptions?: Subscription[];
   isPending: boolean;
 }
+type MockSettingsEnvelopeResult = { data?: SettingsReadModel };
 
 const mocks = vi.hoisted(() => ({
   useInfiniteSubscriptions: vi.fn<() => MockInfiniteSubscriptionsResult>(),
   useSubscriptions: vi.fn(),
-  useSettings: vi.fn(),
+  useSettingsEnvelope: vi.fn<() => MockSettingsEnvelopeResult>(),
   handleAddSubscription: vi.fn(),
   handleDeleteSubscription: vi.fn(),
   handleEditSubscription: vi.fn(),
@@ -63,7 +67,7 @@ const mocks = vi.hoisted(() => ({
     })),
     statuses: [],
     paymentMethods: [],
-    currencies: [],
+    currencies: [] as CustomConfig["currencies"],
   },
 }));
 
@@ -73,12 +77,18 @@ vi.mock("@/hooks/use-subscriptions", () => ({
 }));
 
 vi.mock("@/hooks/use-settings", () => ({
-  useSettings: mocks.useSettings,
+  useSettingsEnvelope: mocks.useSettingsEnvelope,
+  useSettings: () => {
+    const envelope = mocks.useSettingsEnvelope();
+    return { ...envelope, data: envelope.data?.settings };
+  },
 }));
 
 vi.mock("@/hooks/use-exchange-rates", () => ({
   useExchangeRates: () => ({
     convert: (amount: number) => amount,
+    loading: false,
+    sourceDate: "2026-08-01",
   }),
 }));
 
@@ -149,7 +159,7 @@ function subscription(overrides: SubscriptionOverrides = {}): Subscription {
     id: "sub",
     name: "Service",
     logo: undefined,
-    price: 10,
+    price: "10",
     currency: "USD",
     category: "productivity",
     status: "active",
@@ -193,6 +203,16 @@ function renderSubscriptionsPage() {
 
 function visibleSubscriptionNames() {
   return screen.getAllByTestId("subscription-card").map((card) => card.textContent ?? "");
+}
+
+function expectAdvancedOptionRowsContainCodes(container: HTMLElement, codes: string[]) {
+  const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-advanced-option-row]"));
+  expect(rows).toHaveLength(codes.length);
+  codes.forEach((code, index) => {
+    const row = rows[index];
+    expect(row).toBeDefined();
+    expect(row!).toHaveTextContent(code);
+  });
 }
 
 // 这里锁的是“外框限高 + 中间唯一滚动区”的结构契约，不是装饰性 Tailwind 快照。
@@ -244,16 +264,21 @@ describe("Subscriptions page category filters", () => {
   });
 
   beforeEach(() => {
+    mocks.customConfig.currencies = [];
     mocks.useSubscriptions.mockImplementation(() => {
       const infinite = mocks.useInfiniteSubscriptions();
       return { data: infinite.subscriptions ?? [], isPending: false };
     });
-    mocks.useSettings.mockReturnValue({
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      timezone: "Asia/Shanghai",
+      defaultCurrency: "CNY",
+      notificationReminderDays: 5,
+    };
+    mocks.useSettingsEnvelope.mockReturnValue({
       data: {
-        ...DEFAULT_SETTINGS,
-        timezone: "Asia/Shanghai",
-        defaultCurrency: "CNY",
-        notificationReminderDays: 5,
+        settings,
+        secretStatus: appSettingsSecretStatus(settings),
       },
     });
     mocks.useInfiniteSubscriptions.mockReturnValue({
@@ -391,5 +416,33 @@ describe("Subscriptions page category filters", () => {
     expect(within(desktopCategoryFilter).getByRole("button", { name: "分类" })).toBeInTheDocument();
     expect(within(desktopTagFilter).getByRole("button", { name: "标签" })).toBeInTheDocument();
     expect(screen.queryByTestId("desktop-selected-tags")).not.toBeInTheDocument();
+  });
+
+  it("keeps desktop advanced currency options in persisted manager order", async () => {
+    const user = userEvent.setup();
+    mocks.customConfig.currencies = [
+      { id: "AUD", value: "AUD", labels: { "zh-CN": "AUD", "en-US": "AUD" }, enabled: true },
+      { id: "CAD", value: "CAD", labels: { "zh-CN": "CAD", "en-US": "CAD" }, enabled: true },
+      { id: "USD", value: "USD", labels: { "zh-CN": "USD", "en-US": "USD" }, enabled: true },
+      { id: "EUR", value: "EUR", labels: { "zh-CN": "EUR", "en-US": "EUR" }, enabled: true },
+    ];
+    mockMobileTagFilterMatch(false);
+    renderSubscriptionsPage();
+
+    await user.click(within(screen.getByTestId("desktop-advanced-filter")).getByRole("button"));
+    await user.click(within(screen.getByTestId("desktop-advanced-filter-panel")).getByTestId("advanced-currency-entry"));
+
+    const currencyList = within(screen.getByTestId("advanced-currency-dialog")).getByTestId("advanced-currency-picker");
+    expectAdvancedOptionRowsContainCodes(
+      within(currencyList).getByTestId("advanced-currency-picker-all-options"),
+      ["AUD", "CAD", "USD", "EUR"],
+    );
+
+    await user.type(within(currencyList).getByPlaceholderText(/Filter currencies|筛选货币/), "$");
+
+    expectAdvancedOptionRowsContainCodes(
+      within(currencyList).getByTestId("advanced-currency-picker-search-results"),
+      ["AUD", "CAD", "USD"],
+    );
   });
 });

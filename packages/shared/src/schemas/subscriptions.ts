@@ -1,11 +1,18 @@
 import { z } from "zod";
-import { COST_SHARING_SPLIT_MODES, costSharingCustomAmountsAreValid } from "../cost-sharing";
+import {
+  COST_SHARING_SPLIT_MODES,
+  costSharingCollectionAnchorsAreSatisfied,
+  costSharingCustomAmountsAreValid,
+  costSharingMemberJoinedDatesWithinRange,
+} from "../cost-sharing";
+import { moneyStringSchema } from "../money";
 import { apiSuccessResponseSchema } from "./api";
 import { okResponseSchema } from "./common";
 import {
   BILLING_CYCLES,
   CUSTOM_CYCLE_UNITS,
   DISABLED_REMINDER_DAYS,
+  INHERIT_REMINDER_DAYS,
   MAX_REMINDER_DAYS,
   REPEAT_REMINDER_INTERVALS,
   REPEAT_REMINDER_WINDOWS,
@@ -14,6 +21,7 @@ import {
   isValidReminderDays,
   type BillingCycle,
   type CustomCycleUnit,
+  type DateOnly,
   type RepeatReminderInterval,
   type RepeatReminderWindow,
   type SubscriptionStatus,
@@ -53,6 +61,7 @@ export const dateInputSchema = z
   .refine(isValidDateOnly, "Invalid date")
   .describe("日期字符串：必须是 YYYY-MM-DD，不接受带时间或时区的 ISO datetime。");
 const nullableDateInputSchema = dateInputSchema.nullable();
+const dateOnlyOutputSchema = dateInputSchema.transform((value) => value as DateOnly);
 
 const optionalUrlSchema = z
   .string()
@@ -78,23 +87,44 @@ const extraSchema = z.record(z.string(), z.unknown()).optional();
 export const SUBSCRIPTION_PAYMENT_METHOD_NONE = "__none";
 export const SUBSCRIPTION_QUERY_RENEWALS = ["auto", "manual", "one-time"] as const;
 export const SUBSCRIPTION_REMINDER_MODES = ["disabled", "inherit", "custom"] as const;
+export const SUBSCRIPTION_RENEW_MODES = ["continue", "restart"] as const;
 const queryBooleanSchema = z.preprocess((value) => {
   if (value === "true" || value === "1") return true;
   if (value === "false" || value === "0") return false;
   return value;
 }, z.boolean());
+export const reminderDaysSchema = z
+  .number()
+  .int()
+  .min(DISABLED_REMINDER_DAYS)
+  .max(MAX_REMINDER_DAYS)
+  .refine(isValidReminderDays, "Invalid reminder days");
+const costSharingCollectionReminderDaysSchema = z
+  .number()
+  .int()
+  .min(INHERIT_REMINDER_DAYS)
+  .max(MAX_REMINDER_DAYS)
+  .refine((value) => value === INHERIT_REMINDER_DAYS || value >= 0, "Invalid cost sharing collection reminder days");
+const costSharingCollectionReminderSchema = z.object({
+  enabled: z.boolean(),
+  reminderDays: costSharingCollectionReminderDaysSchema,
+}).strict();
 // costSharing 是“当前用户默认付款、成员只代表其他人”的 shared wire shape；旧身份字段必须在迁移层清理，写入层拒绝。
 const costSharingMemberSchema = z.object({
   id: z.string().trim().min(1).max(80),
   name: z.string().trim().min(1).max(80),
   note: z.string().trim().max(500).optional(),
+  // DateOnly 只作为成员收款周期 anchor；付款状态、账本流水和联系方式不属于 v1 契约。
+  joinedDate: dateOnlyOutputSchema.optional(),
   currency: z.string().trim().regex(/^[A-Z]{3}$/).optional(),
-  customAmount: z.number().finite().nonnegative().max(1_000_000_000).optional(),
+  customAmount: moneyStringSchema.optional(),
 }).strict();
 export const costSharingSchema = z.object({
   enabled: z.boolean(),
   splitMode: z.enum(COST_SHARING_SPLIT_MODES),
   members: z.array(costSharingMemberSchema).min(1).max(20),
+  // 收款提醒的事实源仍在 costSharing JSON；D1/PocketBase 只保存内部镜像列给 cron 热路径走索引。
+  collectionReminder: costSharingCollectionReminderSchema.optional(),
 }).strict().refine((value) => {
   if (!value.enabled) return true;
   const ids = new Set(value.members.map((member) => member.id));
@@ -105,13 +135,10 @@ export const costSharingSchema = z.object({
 }).refine((value) => !value.enabled || costSharingCustomAmountsAreValid(value), {
   path: ["members"],
   message: "Invalid custom cost sharing amounts",
+}).refine((value) => value.enabled || value.collectionReminder?.enabled !== true, {
+  path: ["collectionReminder"],
+  message: "Invalid cost sharing collection reminder",
 });
-export const reminderDaysSchema = z
-  .number()
-  .int()
-  .min(DISABLED_REMINDER_DAYS)
-  .max(MAX_REMINDER_DAYS)
-  .refine(isValidReminderDays, "Invalid reminder days");
 
 const oneTimeTermCountSchema = z.number().int().positive().max(MAX_REMINDER_DAYS);
 const oneTimeTermUnitSchema = z.enum(CUSTOM_CYCLE_UNITS);
@@ -138,6 +165,40 @@ function startDateRequirementIsSatisfied(value: {
   return !value.autoCalculateNextBillingDate || value.startDate !== null;
 }
 
+function costSharingCollectionReminderMatchesBillingCycle(value: {
+  billingCycle: BillingCycle;
+  oneTimeTermCount?: number | null | undefined;
+  costSharing?: z.infer<typeof costSharingSchema> | null | undefined;
+}): boolean {
+  // 买断记录没有可推进的家庭收款周期；启用状态必须在写入边界拒绝，而不是让 cron 镜像生成无效候选。
+  if (value.billingCycle !== "one-time" || value.oneTimeTermCount) return true;
+  return value.costSharing?.collectionReminder?.enabled !== true;
+}
+
+function subscriptionDateOrderIsValid(value: {
+  startDate: string | null;
+  nextBillingDate: string;
+}): boolean {
+  return value.startDate === null || value.nextBillingDate >= value.startDate;
+}
+
+function costSharingMemberJoinedDateRangeIsValid(value: {
+  billingCycle: BillingCycle;
+  startDate: string | null;
+  nextBillingDate: string;
+  oneTimeTermCount?: number | null | undefined;
+  oneTimeTermUnit?: CustomCycleUnit | null | undefined;
+  costSharing?: z.infer<typeof costSharingSchema> | null | undefined;
+}): boolean {
+  return costSharingMemberJoinedDatesWithinRange(value.costSharing ?? undefined, {
+    subscriptionStartDate: value.startDate,
+    nextBillingDate: value.nextBillingDate,
+    billingCycle: value.billingCycle,
+    oneTimeTermCount: value.oneTimeTermCount,
+    oneTimeTermUnit: value.oneTimeTermUnit,
+  });
+}
+
 /**
  * 订阅写入请求的跨运行面事实来源。
  *
@@ -147,7 +208,7 @@ function startDateRequirementIsSatisfied(value: {
 const subscriptionWriteBodyShape = {
   name: z.string().trim().min(1).max(120),
   logo: optionalLogoReferenceSchema,
-  price: z.number().finite().nonnegative().max(1_000_000_000),
+  price: moneyStringSchema,
   currency: z.string().trim().regex(/^[A-Z]{3}$/),
   billingCycle: z.enum(BILLING_CYCLES),
   customDays: z.number().int().positive().nullable().optional(),
@@ -186,6 +247,22 @@ export const subscriptionCreateBodySchema = z.object(subscriptionWriteBodyShape)
   .refine(startDateRequirementIsSatisfied, {
     path: ["startDate"],
     message: "Start date is required for one-time subscriptions and automatic billing date calculation",
+  })
+  .refine(subscriptionDateOrderIsValid, {
+    path: ["nextBillingDate"],
+    message: "Next billing date must not be before start date",
+  })
+  .refine(costSharingCollectionReminderMatchesBillingCycle, {
+    path: ["costSharing", "collectionReminder"],
+    message: "Cost sharing collection reminder is not available for one-time buyouts",
+  })
+  .refine((value) => costSharingCollectionAnchorsAreSatisfied(value.costSharing ?? undefined, value.startDate), {
+    path: ["costSharing", "members"],
+    message: "Cost sharing collection reminder requires member joined dates or subscription start date",
+  })
+  .refine(costSharingMemberJoinedDateRangeIsValid, {
+    path: ["costSharing", "members"],
+    message: "Cost sharing member joined date is outside the subscription date range",
   });
 
 export const subscriptionUpdateBodySchema = z.object(subscriptionWriteBodyShape)
@@ -204,6 +281,24 @@ export const subscriptionUpdateBodySchema = z.object(subscriptionWriteBodyShape)
   })
   .refine((obj) => Object.keys(obj).length > 0, { message: "Empty payload" });
 
+export const subscriptionRenewBodySchema = z.object({
+  mode: z.enum(SUBSCRIPTION_RENEW_MODES),
+  price: moneyStringSchema,
+  currency: z.string().trim().regex(/^[A-Z]{3}$/),
+  startDate: nullableDateInputSchema.optional(),
+  nextBillingDate: dateInputSchema,
+  autoCalculateNextBillingDate: z.boolean(),
+}).strict()
+  .describe("手动续订请求：显式选择延续原锚点或从新日期重开，并允许同步调整价格/币种。")
+  .refine((value) => value.mode !== "restart" || value.startDate !== undefined && value.startDate !== null, {
+    path: ["startDate"],
+    message: "Start date is required when restarting a subscription",
+  })
+  .refine((value) => value.startDate === undefined || value.startDate === null || value.nextBillingDate >= value.startDate, {
+    path: ["nextBillingDate"],
+    message: "Next billing date must not be before start date",
+  });
+
 /**
  * 订阅读取响应的稳定 API 形状。
  *
@@ -214,7 +309,7 @@ export const apiSubscriptionSchema = z.object({
   id: z.string(),
   name: z.string(),
   logo: logoReferenceSchema.optional(),
-  price: z.number(),
+  price: moneyStringSchema,
   currency: z.string(),
   billingCycle: z.enum(BILLING_CYCLES),
   customDays: z.number().int().optional(),
@@ -249,6 +344,18 @@ export const apiSubscriptionSchema = z.object({
 }).refine(startDateRequirementIsSatisfied, {
   path: ["startDate"],
   message: "Start date is required for one-time subscriptions and automatic billing date calculation",
+}).refine(subscriptionDateOrderIsValid, {
+  path: ["nextBillingDate"],
+  message: "Next billing date must not be before start date",
+}).refine(costSharingCollectionReminderMatchesBillingCycle, {
+  path: ["costSharing", "collectionReminder"],
+  message: "Cost sharing collection reminder is not available for one-time buyouts",
+}).refine((value) => costSharingCollectionAnchorsAreSatisfied(value.costSharing ?? undefined, value.startDate), {
+  path: ["costSharing", "members"],
+  message: "Cost sharing collection reminder requires member joined dates or subscription start date",
+}).refine(costSharingMemberJoinedDateRangeIsValid, {
+  path: ["costSharing", "members"],
+  message: "Cost sharing member joined date is outside the subscription date range",
 });
 
 export const subscriptionsListQuerySchema = z.object({
@@ -292,6 +399,7 @@ export const subscriptionDeleteResponseSchema = okResponseSchema;
 
 export type SubscriptionsListResponse = z.infer<typeof subscriptionsListPayloadSchema>;
 export type SubscriptionResponse = z.infer<typeof subscriptionPayloadSchema>;
+export type SubscriptionRenewBody = z.infer<typeof subscriptionRenewBodySchema>;
 
 export type ApiSubscription = z.infer<typeof apiSubscriptionSchema> & {
   billingCycle: BillingCycle;

@@ -1,5 +1,6 @@
 // H5 基线 E2E 覆盖登录、设置、订阅弹窗、Logo sheet 和 Select sheet，是移动端布局回归的总闸。
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
+import { expect, test } from "./support/test";
 import {
   createSubscription,
   openAddSubscriptionDialog,
@@ -568,7 +569,7 @@ test("mobile option sheets use consistent detents and do not leak backdrop event
   await expect(subscriptionsRenewalSheet).toHaveAttribute("data-mobile-detent", "compact");
   await dragMobileSheetHandleToClose(page, subscriptionsRenewalSheet, "subscriptions renewal filter sheet");
 
-  await page.getByTestId("mobile-sort-tag-row").getByRole("combobox", { name: "排序" }).click();
+  await page.getByTestId("mobile-renewal-sort-row").getByRole("combobox", { name: "排序" }).click();
   const subscriptionsSortSheet = page.locator(".h5-mobile-sheet-content").filter({ hasText: "到期最近" }).last();
   await expect(subscriptionsSortSheet).toBeVisible();
   await expect(subscriptionsSortSheet).toHaveAttribute("data-mobile-detent", "compact");
