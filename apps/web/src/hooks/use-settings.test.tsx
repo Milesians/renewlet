@@ -9,7 +9,8 @@ import {
   WEBHOOK_PAYLOAD_PLACEHOLDER,
   type AppSettings,
 } from "@/types/subscription";
-import { normalizeSettings, SETTINGS_QUERY_KEY, useSettings, useUpdateSettings } from "./use-settings";
+import { SETTINGS_QUERY_KEY } from "./settings-query-key";
+import { normalizeSettings, useSettings, useUpdateSettings } from "./use-settings";
 import { EMPTY_SETTINGS_SECRET_STATUS, type SettingsReadModel } from "@/services/settings-service";
 
 const mocks = vi.hoisted(() => ({
@@ -52,6 +53,10 @@ function settings(overrides: Partial<AppSettings> = {}): AppSettings {
 
 function settingsEnvelope(overrides: Partial<AppSettings> = {}): SettingsReadModel {
   return { settings: settings(overrides), secretStatus: EMPTY_SETTINGS_SECRET_STATUS };
+}
+
+function normalizePersistedSettings(value: Record<string, unknown>): AppSettings {
+  return normalizeSettings({ localePreference: "auto", ...value });
 }
 
 describe("useSettings query contract", () => {
@@ -115,7 +120,7 @@ describe("useSettings query contract", () => {
 
 describe("normalizeSettings", () => {
   it("clears legacy Webhook example defaults so they stay placeholders only", () => {
-    const settings = normalizeSettings({
+    const settings = normalizePersistedSettings({
       webhookHeaders: WEBHOOK_HEADERS_PLACEHOLDER,
       webhookPayload: WEBHOOK_PAYLOAD_PLACEHOLDER,
     });
@@ -125,7 +130,7 @@ describe("normalizeSettings", () => {
   });
 
   it("defaults historical settings to Frankfurter as the exchange-rate provider", () => {
-    const settings = normalizeSettings({
+    const settings = normalizePersistedSettings({
       defaultCurrency: "USD",
     });
 
@@ -134,7 +139,7 @@ describe("normalizeSettings", () => {
   });
 
   it("fills missing global notification reminder days from defaults", () => {
-    const settings = normalizeSettings({
+    const settings = normalizePersistedSettings({
       defaultCurrency: "USD",
     });
 
@@ -142,7 +147,7 @@ describe("normalizeSettings", () => {
   });
 
   it("rejects invalid exchange-rate providers and falls back to defaults", () => {
-    const settings = normalizeSettings({
+    const settings = normalizePersistedSettings({
       exchangeRateProvider: "unknown",
     });
 
@@ -150,7 +155,7 @@ describe("normalizeSettings", () => {
   });
 
   it("keeps Frankfurter as a supported exchange-rate provider", () => {
-    const settings = normalizeSettings({
+    const settings = normalizePersistedSettings({
       exchangeRateProvider: "frankfurter",
     });
 
@@ -158,7 +163,7 @@ describe("normalizeSettings", () => {
   });
 
   it("fills missing built-in icon source settings from defaults", () => {
-    const settings = normalizeSettings({
+    const settings = normalizePersistedSettings({
       defaultCurrency: "USD",
       builtInIconSources: {
         thesvg: { enabled: false, variantsEnabled: false },
@@ -173,7 +178,7 @@ describe("normalizeSettings", () => {
   });
 
   it("fills missing online icon source settings from defaults", () => {
-    const settings = normalizeSettings({
+    const settings = normalizePersistedSettings({
       defaultCurrency: "USD",
       onlineIconSources: {
         appStore: { enabled: false },

@@ -28,7 +28,7 @@ function clearLegacyWebhookExample(value: string, legacyExample: string) {
 /**
  * 将远端 settings JSON 收敛为前端完整设置。
  *
- * 该函数同时服务产品 API 返回值和历史 settings JSON；不要在页面里绕过它直接消费远端值。
+ * 该函数只接受排他迁移后的持久化契约；不要在页面里绕过它直接消费远端值或兼容旧 locale 字段。
  */
 export function normalizeSettings(value: unknown): AppSettings {
   const defaults = { ...DEFAULT_SETTINGS, timezone: getSystemTimeZone("UTC") };
@@ -57,10 +57,10 @@ function editableSettingsFromPublicView(settings: PublicAppSettings): AppSetting
 
 /** 设置服务统一调用 Renewlet 产品 API；Docker 端也不能回退到 PocketBase collection REST。 */
 export const settingsService = {
-  async get(): Promise<SettingsReadModel> {
+  async get(signal?: AbortSignal): Promise<SettingsReadModel> {
     const userId = getCurrentUserId();
     if (!userId) return { settings: DEFAULT_SETTINGS, secretStatus: EMPTY_SETTINGS_SECRET_STATUS };
-    const data = await apiFetch("/api/app/settings", settingsResponseSchema);
+    const data = await apiFetch("/api/app/settings", settingsResponseSchema, signal ? { signal } : undefined);
     return { settings: editableSettingsFromPublicView(data.settings), secretStatus: data.secretStatus };
   },
 

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDefaultAppSettings } from "@renewlet/shared/settings-defaults";
 import type { ApiAppSettings } from "@renewlet/shared/schemas/settings";
-import type { ApiSubscription } from "@renewlet/shared/schemas/subscriptions";
+import { apiSubscriptionSchema, type ApiSubscription } from "@renewlet/shared/schemas/subscriptions";
 import { collectNotificationItemsForLocalDate, notificationHistory, runScheduledNotifications } from "./notifications";
 import { readSuccessData } from "./api-test-helpers";
 import { createCronJobResult } from "./notification-jobs";
@@ -120,7 +120,7 @@ function settings(overrides: Partial<ApiAppSettings> = {}): ApiAppSettings {
 }
 
 function subscription(overrides: Partial<ApiSubscription> = {}): ApiSubscription {
-  return {
+  return apiSubscriptionSchema.parse({
     id: "sub_quiet",
     name: "Quiet SaaS",
     price: "10",
@@ -139,8 +139,9 @@ function subscription(overrides: Partial<ApiSubscription> = {}): ApiSubscription
     repeatReminderEnabled: false,
     repeatReminderInterval: "1h",
     repeatReminderWindow: "72h",
+    extra: {},
     ...overrides,
-  };
+  });
 }
 
 function subscriptionRow(overrides: Partial<SubscriptionRow> = {}): SubscriptionRow {
@@ -279,7 +280,8 @@ describe("Cloudflare notifications", () => {
       windowMinutes: 2,
       triggeredAtUtc: "2026-01-09T08:00:00Z",
       schedule,
-      settings: settings({ locale: "zh-CN" }),
+      settings: settings({ localePreference: "zh-CN" }),
+      locale: "zh-CN",
       message: {
         title: "Renewlet 订阅提醒",
         content: "今天没有需要提醒的订阅。",
@@ -383,7 +385,7 @@ describe("Cloudflare notifications", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-09T08:00:00.000Z"));
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({
       code: 40001,
       message: "SCTsecret disabled",
     }), {
@@ -420,12 +422,16 @@ describe("Cloudflare notifications", () => {
 
     expect(errorSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      title: "Renewlet subscription reminder",
+    });
     expect(finalizeParams?.[0]).toBe("failed");
     expect(finalizeParams?.[1]).toBe(1);
     expect(String(finalizeParams?.[2])).toContain("[redacted] disabled");
     expect(String(finalizeParams?.[2])).not.toContain("SCTsecret");
     const result = JSON.parse(String(finalizeParams?.[3])) as {
       schedule: Record<string, unknown>;
+      settings: { locale: string };
       channels: { failed: Array<{ channel: string; error: string }> };
     };
     expect(result.schedule).toEqual({
@@ -436,6 +442,7 @@ describe("Cloudflare notifications", () => {
     });
     expect(result.schedule).not.toHaveProperty("due");
     expect(result.schedule).not.toHaveProperty("reason");
+    expect(result.settings.locale).toBe("en-US");
     expect(result.channels.failed[0]?.channel).toBe("serverchan");
     expect(result.channels.failed[0]?.error).toContain("[redacted] disabled");
     expect(result.channels.failed[0]?.error).not.toContain("SCTsecret");

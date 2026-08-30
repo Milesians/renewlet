@@ -145,14 +145,17 @@ func (collector *cloudBackupExportAssetCollector) resolve(assetID string, origin
 }
 
 func buildCloudBackupExportBundle(app core.App, user *core.Record, exportedAt time.Time) (cloudBackupExportBundle, error) {
-	rows, err := listImportExistingSubscriptions(app, user.Id)
+	rows, err := listOwnedSubscriptionRecords(app, user.Id)
 	if err != nil {
 		return cloudBackupExportBundle{}, err
 	}
 	assetCollector := newCloudBackupExportAssetCollector(app, user.Id)
 	subscriptions := make([]interface{}, 0, len(rows))
 	for _, row := range rows {
-		subscription := subscriptionAPIFromRecord(row)
+		subscription, err := subscriptionDetailResponseMap(subscriptionAPIFromRecord(row))
+		if err != nil {
+			return cloudBackupExportBundle{}, err
+		}
 		if logo, ok := subscription["logo"].(string); ok {
 			if assetID := privateAssetIDFromPath(logo); assetID != "" {
 				if assetPath, ok := assetCollector.resolve(assetID, logo, "subscription.logo", row.Id); ok {
@@ -197,13 +200,13 @@ func buildCloudBackupExportBundle(app core.App, user *core.Record, exportedAt ti
 	}
 	payload := map[string]interface{}{
 		"kind":          "renewlet-export",
-		"schemaVersion": 1,
+		"schemaVersion": renewletExportSchemaVersion,
 		"exportedAt":    exportedAt.Format(time.RFC3339Nano),
 		"data":          data,
 	}
 	manifest := cloudBackupExportManifest{
 		Kind:          "renewlet-export",
-		SchemaVersion: 1,
+		SchemaVersion: renewletExportSchemaVersion,
 		ExportedAt:    exportedAt.Format(time.RFC3339Nano),
 		Subscriptions: len(subscriptions),
 		Assets:        len(assetCollector.assets),
@@ -215,6 +218,18 @@ func buildCloudBackupExportBundle(app core.App, user *core.Record, exportedAt ti
 	return cloudBackupExportBundle{Payload: payload, Assets: assetCollector.assets, Manifest: manifest}, nil
 }
 
+func subscriptionDetailResponseMap(subscription subscriptionDetailResponse) (map[string]interface{}, error) {
+	data, err := json.Marshal(subscription)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func cloudBackupExportSettings(app core.App, user *core.Record) (map[string]interface{}, bool, error) {
 	record, err := app.FindFirstRecordByFilter("settings", "user = {:user}", dbx.Params{"user": user.Id})
 	if err != nil {
@@ -223,7 +238,10 @@ func cloudBackupExportSettings(app core.App, user *core.Record) (map[string]inte
 		}
 		return nil, false, err
 	}
-	settings := settingsFromRecord(record)
+	settings, err := settingsFromRecord(record)
+	if err != nil {
+		return nil, false, err
+	}
 	data, err := json.Marshal(settings)
 	if err != nil {
 		return nil, false, err
@@ -246,6 +264,13 @@ func cloudBackupExportSettings(app core.App, user *core.Record) (map[string]inte
 		ai["baseUrl"] = ""
 		ai["apiKey"] = ""
 	}
+	// Go 无法复用 shared Zod helper，必须镜像同一 v1 投影：auto 省略，明确偏好才写入旧 locale。
+	// 缺失 locale 的导入会保留目标账号偏好，不能在导出端把 auto 固化为某个实际语言。
+	localePreference, _ := out["localePreference"].(string)
+	delete(out, "localePreference")
+	if localePreference == string(localeZhCN) || localePreference == string(localeEnUS) {
+		out["locale"] = localePreference
+	}
 	return out, true, nil
 }
 
@@ -262,7 +287,7 @@ func cloudBackupExportCustomConfig(app core.App, user *core.Record, assetCollect
 		return nil, false, err
 	}
 	var config customConfigPayload
-	if err := decodeStrictJSONBytesInto(data, &config, localeZhCN, false); err != nil {
+	if err := decodeStrictJSONBytesInto(data, &config, defaultAppLocale, false); err != nil {
 		return nil, false, err
 	}
 	if err := normalizeCustomConfigPayload(&config); err != nil {

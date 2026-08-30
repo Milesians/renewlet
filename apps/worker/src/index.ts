@@ -37,12 +37,23 @@ import {
   deleteCalendarFeed,
   deleteSubscriptionCalendarFeed,
   downloadSubscriptionCalendarIcs,
+  listSubscriptionCalendarFeeds,
   readCalendarFeed,
   readSubscriptionCalendarFeed,
+  rotateCalendarFeed,
+  rotateSubscriptionCalendarFeed,
 } from "./calendar-feed";
 import { readCustomConfig, readSettings, updateCustomConfig, updateSettings } from "./settings";
 import { putExchangeRateSnapshot, readExchangeRateSnapshots } from "./exchange-rate-snapshots";
 import { createSubscription, deleteSubscription, readSubscriptions, renewSubscription, updateSubscription } from "./subscriptions";
+import {
+  readSubscriptionAnalytics,
+  readSubscriptionCalendar,
+  readSubscriptionDetail,
+  readSubscriptionExport,
+  readSubscriptionFacets,
+  readSubscriptionIndex,
+} from "./subscription-collections";
 import { applyImport, previewImport } from "./import-export";
 import {
   createCloudBackup,
@@ -250,10 +261,20 @@ defineRoute(subscriptionRoutes, "/", {
   GET: (context) => readSubscriptions(context.req.raw, context.env),
   POST: (context) => createSubscription(context.req.raw, context.env),
 });
+// 集合静态路由先于 /:id 注册，避免 Hono 把 index/analytics/calendar-feeds/facets/export 当作订阅 ID。
+defineRoute(subscriptionRoutes, "/index", { GET: (context) => readSubscriptionIndex(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/analytics", { GET: (context) => readSubscriptionAnalytics(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/calendar", { GET: (context) => readSubscriptionCalendar(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/calendar-feeds", { GET: (context) => listSubscriptionCalendarFeeds(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/facets", { GET: (context) => readSubscriptionFacets(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/export", { GET: (context) => readSubscriptionExport(context.req.raw, context.env) });
 defineRoute(subscriptionRoutes, "/:id/calendar-feed", {
   GET: (context) => readSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
   POST: (context) => createSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
   DELETE: (context) => deleteSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
+});
+defineRoute(subscriptionRoutes, "/:id/calendar-feed/rotate", {
+  POST: (context) => rotateSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
 });
 defineRoute(subscriptionRoutes, "/:id/calendar.ics", {
   GET: (context) => downloadSubscriptionCalendarIcs(context.req.raw, context.env, routeParam(context, "id")),
@@ -262,6 +283,7 @@ defineRoute(subscriptionRoutes, "/:id/renew", {
   POST: (context) => renewSubscription(context.req.raw, context.env, routeParam(context, "id")),
 });
 defineRoute(subscriptionRoutes, "/:id", {
+  GET: (context) => readSubscriptionDetail(context.req.raw, context.env, routeParam(context, "id")),
   PATCH: (context) => updateSubscription(context.req.raw, context.env, routeParam(context, "id")),
   DELETE: (context) => deleteSubscription(context.req.raw, context.env, routeParam(context, "id")),
 });
@@ -307,7 +329,9 @@ defineRoute(app, "/api/app/calendar-feed", {
   POST: (context) => createCalendarFeed(context.req.raw, context.env),
   DELETE: (context) => deleteCalendarFeed(context.req.raw, context.env),
 });
-
+defineRoute(app, "/api/app/calendar-feed/rotate", {
+  POST: (context) => rotateCalendarFeed(context.req.raw, context.env),
+});
 defineRoute(app, "/api/app/public-status-page", {
   GET: (context) => readPublicStatusPage(context.req.raw, context.env),
   POST: (context) => createPublicStatusPage(context.req.raw, context.env),
@@ -427,6 +451,23 @@ function health(): Response {
   return successJson(healthPayloadSchema.parse({ time: new Date().toISOString() }));
 }
 
+function maintenanceResponse(): Response {
+  return Response.json(
+    { error: { code: "MAINTENANCE_MODE", message: "Renewlet is temporarily unavailable during a database upgrade." } },
+    {
+      status: 503,
+      headers: {
+        "cache-control": "no-store",
+        "retry-after": "900",
+      },
+    },
+  );
+}
+
+function maintenanceModeEnabled(env: Env): boolean {
+  return env.RENEWLET_MAINTENANCE_MODE === "true";
+}
+
 async function ready(env: Env): Promise<Response> {
   // ready 只验证 D1 binding 可用；R2/第三方 provider 不应拖慢平台健康检查。
   await env.DB.prepare("SELECT 1").first();
@@ -435,15 +476,24 @@ async function ready(env: Env): Promise<Response> {
 
 const worker: ExportedHandler<Env> = {
   fetch(request, env, context) {
+    // 维护响应必须在 Hono、认证和 D1 之前短路；Static Assets 未命中 run_worker_first，仍可继续托管 SPA。
+    if (maintenanceModeEnabled(env)) return maintenanceResponse();
     // 保留原始 ExecutionContext 传给 Hono；后续 middleware/handler 需要平台 waitUntil 时只能从这里继承。
     return app.fetch(request, env, context);
   },
 
   async scheduled(_controller, env) {
+    // 排他迁移期间不再启动后台写入，部署编排器会等待旧 invocation 的 15 分钟平台上限后才写 D1。
+    if (maintenanceModeEnabled(env)) return;
     await runScheduledTasks(env);
   },
 
   async queue(batch, env) {
+    if (maintenanceModeEnabled(env)) {
+      // consumer 解绑存在传播竞态；已送达 maintenance version 的 batch 延迟重试，不能确认或进入 DLQ。
+      batch.retryAll({ delaySeconds: 900 });
+      return;
+    }
     // Queue consumer 只处理后台图标索引切换；HTTP refresh 已在 D1 job 中暴露 queued/running/failed 状态。
     await consumeBuiltInIconIndexRefreshQueue(batch, env);
   },

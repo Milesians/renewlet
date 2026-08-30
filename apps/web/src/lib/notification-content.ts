@@ -22,8 +22,8 @@ import type {
 import { effectiveReminderDays, isDisabledReminderDays } from "@renewlet/shared/runtime";
 import { daysBetweenDateOnly, isValidDateOnly, todayDateOnlyInTimeZone, type DateOnly } from "@/lib/time/date-only";
 import { isValidTimeZone } from "@/lib/time/time-zone";
-import { DEFAULT_LOCALE, normalizeLocale, type Locale } from "@/i18n/locales";
-import { translateStaticMessage, type MessageKey, type MessageParams } from "@/i18n/static-catalogs";
+import { DEFAULT_LOCALE, localeForPreference, type Locale } from "@/i18n/locales";
+import { translate, type MessageKey, type MessageParams } from "@/i18n/messages";
 import { divideMoney, moneyToNumber, type MoneyString } from "@renewlet/shared/money";
 import { costSharingCollectionReminderOccurrencesForDate } from "@renewlet/shared/cost-sharing";
 
@@ -150,7 +150,7 @@ function repeatIntervalHours(interval: string): number {
 }
 
 function translateNotification(locale: Locale, key: MessageKey, params: MessageParams = {}): string {
-  return translateStaticMessage(locale, key, params);
+  return translate(locale, key, params);
 }
 
 function formatItemLine(item: NotificationContentItem, locale: Locale): string {
@@ -393,5 +393,5 @@ export function buildDueNotificationForLocalDate(
   subscriptions: SubscriptionForNotification[],
 ): NotificationContent {
   const items = collectNotificationItemsForLocalDate(localDate, settings, subscriptions);
-  return buildNotificationContentFromItems(now, settings.timezone || "UTC", items, normalizeLocale(settings.locale));
+  return buildNotificationContentFromItems(now, settings.timezone || "UTC", items, localeForPreference(settings.localePreference));
 }
